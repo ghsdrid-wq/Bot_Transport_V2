@@ -1,10 +1,128 @@
 import win32com.client as win32
 import win32gui
 import win32con
+import win32process
 import pythoncom
+import re
+import subprocess
+import threading
 import time, os
 
 MIN_PNG_BYTES = 10_240   # 10 KB — ตาม Createphoto.py
+
+
+_FILE_CONTENTS_RE = re.compile(r'File\.Contents\(\s*"([^"]+)"\s*\)')
+
+
+def _excel_pid(excel):
+    """PID ของ EXCEL.EXE ตัวที่เราเปิด — ไว้สั่งฆ่าตอนค้าง"""
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(excel.Hwnd)
+        return int(pid or 0)
+    except Exception:
+        return 0
+
+
+def _kill_excel(pid):
+    if not pid:
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass
+
+
+class ExcelWatchdog:
+    """ฆ่า Excel ถ้าขั้นตอนหนึ่งค้างเกินเวลาที่กำหนด
+
+    Power Query / dialog ของ Excel เป็น modal — พอเด้งขึ้นมา COM call จะบล็อกค้าง
+    ตรงนั้นเลย ลูป stop_checker ไม่ถูกเรียก บอทจึงแขวนถาวร ต้องฆ่า process
+    จากอีก thread เท่านั้นถึงจะหลุด
+    """
+
+    def __init__(self, pid, seconds, step, log=None):
+        self.pid = pid
+        self.seconds = seconds
+        self.step = step
+        self.log = log
+        self.fired = False
+        self._timer = None
+
+    def _fire(self):
+        self.fired = True
+        if self.log:
+            self.log(f"  ⚠ Excel ค้างเกิน {self.seconds}s ที่ขั้นตอน '{self.step}' — บังคับปิด Excel")
+        _kill_excel(self.pid)
+
+    def __enter__(self):
+        if self.pid and self.seconds:
+            self._timer = threading.Timer(self.seconds, self._fire)
+            self._timer.daemon = True
+            self._timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._timer:
+            self._timer.cancel()
+        if self.fired:
+            raise RuntimeError(
+                f"[createpng] Excel ไม่ตอบสนองที่ขั้นตอน '{self.step}' "
+                f"(เกิน {self.seconds}s) — มักเกิดจาก Power Query หา source file ไม่เจอ"
+            )
+        return False
+
+
+def repoint_queries(wb, source_folder, log=None):
+    """ชี้ Power Query ในไฟล์ให้อ่านจากโฟลเดอร์ที่บอทเซฟไฟล์ report ไว้จริง
+
+    template ฝัง path เต็มของเครื่องที่สร้างมันไว้ (เช่น
+    ``C:/Users/.../Transport_V2/code/report.xlsx``) พอย้ายไปเครื่องอื่น
+    แล้วหาไฟล์ไม่เจอ Power Query จะเด้ง dialog ที่ ``DisplayAlerts=False``
+    ปิดไม่ได้ ทำให้ Excel ค้าง (ไม่มีการตอบสนอง) — เปลี่ยนแค่ส่วนโฟลเดอร์
+    เก็บชื่อไฟล์เดิมไว้ ทำให้แต่ละ query ยังชี้ไฟล์ของตัวเอง
+    """
+    if not source_folder:
+        return 0
+
+    try:
+        count = int(wb.Queries.Count)
+    except Exception:
+        return 0
+
+    changed = 0
+    for i in range(1, count + 1):
+        try:
+            query = wb.Queries(i)
+            formula = str(query.Formula)
+        except Exception:
+            continue
+
+        def _swap(match):
+            old_path = match.group(1)
+            new_path = os.path.join(source_folder, os.path.basename(old_path))
+            return 'File.Contents("' + new_path + '")'
+
+        new_formula = _FILE_CONTENTS_RE.sub(_swap, formula)
+        if new_formula == formula:
+            continue
+        try:
+            query.Formula = new_formula
+            changed += 1
+            if log:
+                old = _FILE_CONTENTS_RE.search(formula).group(1)
+                new = _FILE_CONTENTS_RE.search(new_formula).group(1)
+                log(f"  Repoint query '{query.Name}'")
+                log(f"    จาก : {old}")
+                log(f"    เป็น: {new}")
+        except Exception as exc:
+            if log:
+                log(f"  แก้ path ของ query '{query.Name}' ไม่ได้: {exc}")
+
+    return changed
 
 
 def _pump(seconds=0.5):
@@ -79,7 +197,8 @@ def run_create(
     output_path,
     report_date=None,
     log=None,
-    stop_checker=None
+    stop_checker=None,
+    source_folder=None
 ):
     def write(msg):
         if log:
@@ -114,35 +233,63 @@ def run_create(
     pythoncom.CoInitialize()
     excel = None
     wb    = None
+    excel_pid = 0
 
     try:
         # ------------------------------------------------------------------
         # 1. เปิด Excel — Visible=True แต่ย้ายออกนอกจอทันที
         #    ไม่ใช้ Minimize/SW_HIDE เพราะทำให้ GDI ไม่ render → รูปขาว
         # ------------------------------------------------------------------
+        init_error = None
         for attempt in range(1, 4):
             try:
                 excel = win32.DispatchEx("Excel.Application")
+                excel_pid = _excel_pid(excel)
                 excel.DisplayAlerts  = False
                 excel.Visible        = True
                 excel.ScreenUpdating = True
                 excel.EnableEvents   = False
+                for prop, value in (("AskToUpdateLinks", False), ("AutomationSecurity", 3)):
+                    try:
+                        setattr(excel, prop, value)
+                    except Exception:
+                        pass
                 _move_excel_offscreen(excel)   # ย้ายออกนอกจอก่อนเปิดไฟล์
                 break
             except Exception as e:
-                write(f"  Excel init failed (attempt {attempt}/3): {e}")
+                init_error = e
+                write(f"  Excel init failed (attempt {attempt}/3): {type(e).__name__}: {e}")
+                # DispatchEx อาจสำเร็จแล้วไปพังตอน set property — ต้องเก็บกวาด
+                # instance ที่ค้างก่อน ไม่งั้นวนอีก 2 รอบได้ EXCEL.EXE ผี 3 ตัว
+                # และ ``excel`` ที่ค้างอยู่จะทำให้เช็ค ``if not excel`` ผ่านไปทั้งที่ยังไม่พร้อม
+                try:
+                    if excel is not None:
+                        excel.Quit()
+                except Exception:
+                    pass
+                _kill_excel(excel_pid)
+                excel = None
+                excel_pid = 0
                 time.sleep(2)
 
-        if not excel:
-            raise RuntimeError("[createpng] Excel ไม่สามารถเปิดได้")
+        if excel is None:
+            raise RuntimeError(
+                "[createpng] เปิด Excel ผ่าน COM ไม่ได้"
+                + (f" — {type(init_error).__name__}: {init_error}" if init_error else "")
+                + " (เครื่องนี้ต้องติดตั้ง Microsoft Excel และเปิดใช้งาน/ยอมรับ license แล้ว"
+                  " อย่างน้อย 1 ครั้งด้วยตัวเอง)"
+            )
+
+        write(f"  Excel PID  : {excel_pid or 'ไม่ทราบ'}")
 
         write("  Opening workbook...")
-        wb = excel.Workbooks.Open(
-            excel_path,
-            UpdateLinks=0,
-            ReadOnly=False,
-            IgnoreReadOnlyRecommended=True,
-        )
+        with ExcelWatchdog(excel_pid, 120, "เปิดไฟล์ Excel", write):
+            wb = excel.Workbooks.Open(
+                excel_path,
+                UpdateLinks=0,
+                ReadOnly=False,
+                IgnoreReadOnlyRecommended=True,
+            )
 
         _move_excel_offscreen(excel)
         _hide_from_taskbar(excel)   # ซ่อนออกจาก taskbar หลังเปิดไฟล์
@@ -168,12 +315,19 @@ def run_create(
         # ------------------------------------------------------------------
         # 4. Refresh + คำนวณ
         # ------------------------------------------------------------------
+        if source_folder:
+            with ExcelWatchdog(excel_pid, 60, "แก้ path ของ Power Query", write):
+                fixed = repoint_queries(wb, source_folder, log=write)
+            if fixed:
+                write(f"  แก้ path ของ query แล้ว {fixed} รายการ")
+
         write("  Refreshing data...")
-        wb.RefreshAll()
-        try:
-            excel.CalculateUntilAsyncQueriesDone()
-        except Exception as e:
-            write(f"  CalculateUntilAsync warning: {e}")
+        with ExcelWatchdog(excel_pid, 300, "Refresh Power Query", write):
+            wb.RefreshAll()
+            try:
+                excel.CalculateUntilAsyncQueriesDone()
+            except Exception as e:
+                write(f"  CalculateUntilAsync warning: {e}")
 
         # รอ Excel คำนวณเสร็จ (แบบ wait_excel ใน Createphoto.py)
         write("  Waiting for Excel to calculate...")
@@ -333,4 +487,5 @@ def run_create(
                 del excel
         except Exception as e:
             write(f"  excel.Quit warning: {e}")
+            _kill_excel(excel_pid)
         pythoncom.CoUninitialize()

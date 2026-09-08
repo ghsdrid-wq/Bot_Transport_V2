@@ -17,7 +17,7 @@
 | ไฟล์ | หน้าที่ |
 |------|---------|
 | `Bot_Fei_Main.py` | **ตัวหลัก (~2,200 บรรทัด)** — UI + scheduler + Feishu (token, `send_feishu_image_by_chat_id`, `send_feishu_file_by_chat_id`) + export Main/Branch transport + job config (sheets/range/output หลายชุด). ทั้งสอง export ใช้ header ชุดเดียวกันจาก `_jms_headers()`, ถาม `total` จาก endpoint ค้นหาของเมนูก่อน แล้วค่อยสั่ง export และกรอง task ใน `/export/selectTask` ด้วย `url` + `createTime` ของตัวเอง |
-| `createpng.py` | Excel → PNG ด้วย win32com (เหมือน `Bot_Transport/createpng.py`) |
+| `createpng.py` | Excel → PNG ด้วย win32com. มี `repoint_queries()` เขียน path ใน Power Query ให้ชี้ โฟลเดอร์ `jms_save_path` ก่อน refresh, `ExcelWatchdog` ฆ่า EXCEL.EXE เมื่อค้างเกินเวลา และ `_kill_excel()` เก็บกวาด process ผี |
 | `sendfeishu.py` | ส่ง Feishu แบบ webhook + HMAC (เหมือน `Bot_Transport`) |
 | `pyi_rth_tkinter_paths.py` | PyInstaller runtime hook แก้ path tkinter ตอน build เป็น exe |
 | `Excel/` | template: `1Main_Line_Transport_Report.xlsx`, `2Branch_Line_Transport_Report.xlsx`, `report.xlsx`, `Report2.xlsx` |
@@ -79,6 +79,19 @@
     ค่าที่ผู้ใช้ตั้งเองเพื่อดึงย้อนหลังจึงอยู่รอดจนกว่าจะพ้นเที่ยงรอบถัดไป
   ถ้าเทียบกับไฟล์ export มือแล้วจำนวนแถวไม่ตรง ให้ตรวจช่วงวันที่ใน Home ก่อนเสมอ
 - Main ไม่ต้องส่ง `count` (ต่างจาก Branch) — `size: 100` ไม่ตัดจำนวนแถวที่ export (ทดสอบแล้วได้ครบ 116 แถว)
+
+## Excel → PNG: กับดักที่เจอมาแล้ว
+- **template ฝัง path เต็มของเครื่องที่สร้างมัน** — Power Query ในไฟล์ `Excel/*.xlsx` เขียนไว้เป็น
+  `Excel.Workbook(File.Contents("C:/Users/.../Transport_V2/code/report.xlsx"))`
+  - ย้ายไปเครื่องอื่นแล้วหาไฟล์ไม่เจอ → Power Query เด้ง **modal dialog ที่ `DisplayAlerts=False` ปิดไม่ได้**
+    → COM call บล็อก → Excel "ไม่มีการตอบสนอง" และบอทแขวนถาวร (ลูป `stop_checker` ไม่ถูกเรียกด้วยซ้ำ)
+  - บนเครื่องเดิม path เก่ายังมีไฟล์ค้างอยู่ เลย refresh ผ่านแบบเงียบ ๆ **แต่อ่านข้อมูลเก่าผิดไฟล์**
+  - แก้: `repoint_queries()` เขียน path ใหม่ทุกครั้งก่อน refresh (เปลี่ยนเฉพาะโฟลเดอร์ เก็บชื่อไฟล์เดิม)
+- **modal dialog ของ Excel หลุด `DisplayAlerts` ได้** — ต้องตั้ง `AskToUpdateLinks=False` และ
+  `AutomationSecurity=3` เพิ่ม และมี `ExcelWatchdog` ฆ่า process จาก thread อื่นเป็นทางหนีสุดท้าย
+- **retry ตอนเปิด Excel ต้องเก็บกวาดของเดิม** — `DispatchEx` อาจสำเร็จแล้วไปพังตอน set property
+  ถ้าไม่ Quit/kill ก่อนวนใหม่ จะได้ EXCEL.EXE ผีสะสม และตัวแปร `excel` ที่ค้างจะหลุดเช็ค `if not excel`
+- template เส้นรองยังเป็น query ของเมนูเก่า (61 คอลัมน์) — `Report2.xlsx` ตอนนี้ 53 คอลัมน์ ต้องรื้อ template
 
 ## ข้อควรระวัง
 - ต้องรันบน Windows + Excel

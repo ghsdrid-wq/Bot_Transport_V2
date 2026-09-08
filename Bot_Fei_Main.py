@@ -30,9 +30,10 @@ import requests
 from tkcalendar import DateEntry
 
 try:
-    from createpng import run_create
+    from createpng import run_create, repoint_queries
 except Exception as exc:  # pragma: no cover
     run_create = None
+    repoint_queries = None
     CREATEPNG_IMPORT_ERROR = exc
 else:
     CREATEPNG_IMPORT_ERROR = None
@@ -1931,6 +1932,11 @@ class App(ctk.CTk):
             excel.DisplayAlerts = False
             excel.Visible = False
             excel.EnableEvents = False
+            for prop, value in (("AskToUpdateLinks", False), ("AutomationSecurity", 3)):
+                try:
+                    setattr(excel, prop, value)
+                except Exception:
+                    pass
 
             wb = excel.Workbooks.Open(
                 excel_path,
@@ -1948,6 +1954,13 @@ class App(ctk.CTk):
                     ws.Range("B2").Value = report_date
                 except Exception:
                     pass
+
+            source_folder = self.get_setting("jms_save_path")
+            if repoint_queries and source_folder:
+                try:
+                    repoint_queries(wb, source_folder, log=self.write_log)
+                except Exception as exc:
+                    self.write_log(f"แก้ path ของ Power Query ไม่สำเร็จ: {exc}", level="WARN")
 
             wb.RefreshAll()
             try:
@@ -2053,7 +2066,8 @@ class App(ctk.CTk):
                     image_path,
                     report_date=str(self.start_date.get_date()),
                     log=self.write_log,
-                    stop_checker=lambda: self.stop_requested
+                    stop_checker=lambda: self.stop_requested,
+                    source_folder=self.get_setting("jms_save_path"),
                 )
 
                 if not os.path.exists(image_path):
