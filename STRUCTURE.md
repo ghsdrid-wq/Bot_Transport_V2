@@ -6,7 +6,7 @@
 ## ภาพรวม
 **เวอร์ชัน 2 ของ `Bot_Transport`** — รีไรต์ `Bot_Fei_Main.py` ให้รองรับ **หลาย report** และส่งได้ทั้งรูปและไฟล์เข้า Feishu Chat:
 - **Main Line Transport** export (JMS) — `report.xlsx`
-- **Branch Line / Task Tracking** export (JMS อีก endpoint) — `Report2.xlsx` / `Branch_Task_Tracking.xlsx`
+- **Branch Line Transport** export (JMS) — `Report2.xlsx` / `Branch_Task_Tracking.xlsx`
 - แปลง Excel → PNG แล้วส่งเข้า Feishu Chat (รองรับ job sheets/range หลายชุด)
 
 ## วิธีรัน / Entry point
@@ -16,7 +16,7 @@
 ## โครงสร้างไฟล์
 | ไฟล์ | หน้าที่ |
 |------|---------|
-| `Bot_Fei_Main.py` | **ตัวหลัก (~2,200 บรรทัด)** — UI + scheduler + Feishu (token, `send_feishu_image_by_chat_id`, `send_feishu_file_by_chat_id`) + export Main/Branch transport + job config (sheets/range/output หลายชุด) |
+| `Bot_Fei_Main.py` | **ตัวหลัก (~2,200 บรรทัด)** — UI + scheduler + Feishu (token, `send_feishu_image_by_chat_id`, `send_feishu_file_by_chat_id`) + export Main/Branch transport + job config (sheets/range/output หลายชุด). ทั้งสอง export ใช้ header ชุดเดียวกันจาก `_jms_headers()`, ถาม `total` จาก endpoint ค้นหาของเมนูก่อน แล้วค่อยสั่ง export และกรอง task ใน `/export/selectTask` ด้วย `url` + `createTime` ของตัวเอง |
 | `createpng.py` | Excel → PNG ด้วย win32com (เหมือน `Bot_Transport/createpng.py`) |
 | `sendfeishu.py` | ส่ง Feishu แบบ webhook + HMAC (เหมือน `Bot_Transport`) |
 | `pyi_rth_tkinter_paths.py` | PyInstaller runtime hook แก้ path tkinter ตอน build เป็น exe |
@@ -30,6 +30,7 @@
 
 ## Config (`config.ini`, `[SETTING]`)
 - Scheduler: `run_hour_interval`, `run_minute_interval`, `start_hour`, `end_hour`
+- `start_date` / `end_date` เป็นแค่ค่าที่เขียนกลับไว้ดู — ตอนเปิดโปรแกรมจะถูกคำนวณใหม่จากเวลาจริงเสมอ
 - เปิด/ปิดงาน: `run_main_transport`, `run_branch_transport`, `run_feishu_chat`
 - ไฟล์: `main_transport_filename` (report.xlsx), `branch_transport_filename` (Report2.xlsx)
 - Feishu/PNG: `excel_file`, `excel_sheet_index`, `excel_range`, `chat_id`, `app_id`, `app_secret` ฯลฯ
@@ -37,6 +38,47 @@
 ## Dependencies / บริการภายนอก
 - `customtkinter`, `tkcalendar`, `pywin32` (ต้องมี Microsoft Excel), `requests`
 - JMS J&T (Main + Branch endpoints), Feishu OpenAPI
+
+## เมนู JMS ที่แต่ละ export ดึงมา
+> ⚠️ ต้องตรงกับเมนูบนเว็บ JMS จริง — ถ้าดึงผิดเมนู จำนวนคอลัมน์/แถวจะไม่ตรงกับที่ผู้ใช้ export มือ
+
+| | เส้นหลัก (Main) | เส้นรอง (Branch) |
+|---|---|---|
+| เมนูบนเว็บ | รายงานสรุปการขนส่ง | รายงานขนส่งรวมสายย่อย |
+| `routeName` | `monitoringReport` | `transportSynthesizeReport` |
+| endpoint นับจำนวน | `/tmsShipmentEvent/report` | `/tmsBranchShipmentEvent/report` |
+| endpoint export | `/tmsExportTransportReport/reportExport` | `/tmsExportTransportReport/branchReportExport` |
+| taskName ใน selectTask | `运输综合查询导出` | `支线运输综合报表导出` |
+| จำนวนคอลัมน์ | 63 | 53 |
+| ดาวน์โหลด | `https://yl-file.jtexpress.co.th/{ossUrl}` ตรง ๆ | ผ่าน `/file/oss/getDownloadSignedUrl` |
+| ตัวกรองเวลา | `timeType: 2` + `newTimeType: 1` | `timeType: 1` + `source: 2` |
+| ตัวกรองสาขา | `arriveNetworkCodeList: ["999004"]` | `arriveNetworkCodeList: ["999004"]` |
+| ต้องส่ง `count` | ไม่ต้อง | **ต้อง** (ไม่งั้นได้ไม่ครบ) |
+
+**ห้ามใช้** `/tmsBranchTrackingDetail/page` + `/tmsnewBranchShipment/trackDetailExport` (เมนู "ติดตามสถานะการขนส่งเส้นรอง")
+สำหรับเส้นรอง — คนละรายงาน คนละชุดใบงาน
+
+## หมายเหตุเรื่องข้อมูลที่ export
+- `_jms_headers()` — header ชุดเดียวที่ใช้ทั้ง Main และ Branch. `lang`/`langtype` = `TH` คือตัวที่ทำให้ JMS
+  คืน **หัวคอลัมน์เป็นภาษาไทย** (ถ้าขาดไปจะได้หัวคอลัมน์จีน) และ `timezone: GMT+0700` ทำให้ตีความช่วงเวลาเป็นเวลาไทย
+- ทั้งสอง export กรอง task จาก `/export/selectTask` ด้วย `exportUrls` + เทียบ `row["url"]` และ `createTime`
+  กับเวลาที่เพิ่งสั่งงาน — ป้องกันไม่ให้ Main ไปหยิบไฟล์ของ Branch (หรือ task เก่า) มาเป็นผลลัพธ์
+- ตัวกรองเวลา: Main ใช้ `timeType: 2` + `newTimeType: 1`, Branch ใช้ `timeType: 1` + `startDepartureTimeStr`/
+  `endDepartureTimeStr` — ทั้งคู่กรองที่ **เวลาที่คาดว่าจะปล่อยรถ** (`plannedDepartureTime`)
+- **ช่วงวันที่ของสองเส้นไม่เท่ากัน** — `get_datetime_range(day_offset)`
+  - **เส้นรอง (Branch)** = ช่วงที่ตั้งบน UI ตรง ๆ → *วันนี้ 12:00 → พรุ่งนี้ 12:00*
+  - **เส้นหลัก (Main)** = เลื่อนย้อนหลัง `MAIN_DAY_OFFSET` (= -1) วัน → *เมื่อวาน 12:00 → วันนี้ 12:00*
+  ปลายช่วงหักออก 1 วินาทีเสมอ (`11:59:59`) เพื่อไม่ให้คาบเกี่ยวกับรอบถัดไป
+- **วันที่ขยับเองอัตโนมัติ** — `_cycle_dates()` คิดวันของรอบปัจจุบันจากเวลาจริง โดยถือว่า
+  หนึ่งรอบเริ่มที่ `start_hour` (ปกติ 12:00) ของแต่ละวัน ก่อนถึงเวลานั้นยังนับเป็นรอบของเมื่อวาน
+  - `refresh_cycle_dates()` เลื่อนวันบน DateEntry + เขียนกลับ config (main thread เท่านั้น)
+  - `refresh_cycle_dates_threadsafe()` เวอร์ชันที่เรียกจาก scheduler thread ได้
+  - `_watch_cycle_rollover()` ตั้ง `after(60s)` วนเช็คตัวเอง เปิดโปรแกรมค้างข้ามวันก็ขยับให้เอง
+  - จุดที่เรียก: ตอนเปิดโปรแกรม (`_load_values_to_ui`), ทุก 60 วิ (watcher) และก่อนทุกรอบของ `scheduler_loop`
+  - `_applied_cycle` จำรอบล่าสุดที่เขียนลง UI ไปแล้ว — ทำให้ขยับเฉพาะตอนรอบเปลี่ยนจริง
+    ค่าที่ผู้ใช้ตั้งเองเพื่อดึงย้อนหลังจึงอยู่รอดจนกว่าจะพ้นเที่ยงรอบถัดไป
+  ถ้าเทียบกับไฟล์ export มือแล้วจำนวนแถวไม่ตรง ให้ตรวจช่วงวันที่ใน Home ก่อนเสมอ
+- Main ไม่ต้องส่ง `count` (ต่างจาก Branch) — `size: 100` ไม่ตัดจำนวนแถวที่ export (ทดสอบแล้วได้ครบ 116 แถว)
 
 ## ข้อควรระวัง
 - ต้องรันบน Windows + Excel

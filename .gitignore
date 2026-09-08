@@ -1,0 +1,18 @@
+# ค่าตั้งเครื่อง + ความลับ (มี JMS auth token / Feishu app secret)
+/config.ini
+/excel_jobs.json
+
+# log / cache
+*.log
+__pycache__/
+*.pyc
+
+# ผลลัพธ์ตอน build
+/build/
+/dist/
+/*.spec
+
+# ไฟล์ที่ export ออกมา (ของจริงตอนรัน ไม่ใช่ template ใน Excel/)
+/report.xlsx
+/Report*.xlsx
+/*_Transport_Report*.xlsx

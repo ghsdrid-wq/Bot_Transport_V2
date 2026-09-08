@@ -411,9 +411,13 @@ def send_feishu_file_by_chat_id(token: str, chat_id: str, file_key: str, log=Non
 # =========================
 # C) JMS EXPORT MODULE
 # =========================
+# เส้นหลักดึงข้อมูลย้อนหลัง 1 วันจากช่วงที่เลือกบน UI
+# (UI = ช่วงของเส้นรอง: วันนี้ 12:00 → พรุ่งนี้ 12:00, เส้นหลัก: เมื่อวาน 12:00 → วันนี้ 12:00)
+MAIN_DAY_OFFSET = -1
+
 MAIN_TRACKING_COLUMNS = [
-    "shipmentNo", "shipmentState", "shipmentName", "gxType", "businessAttribute",
-    "shifts", "operationModel", "billingWay", "shipmentType", "plateNumber",
+    "shipmentNo", "shipmentName", "gxType", "shipmentState", "shifts",
+    "operationModel", "billingWay", "shipmentType", "plateNumber",
     "plateNumberProvince", "trailerNumber", "vehicleBelongName", "vehicleOrigin",
     "driverName", "sendNetworkCode", "sendNetworkName", "loadingScanStartTime",
     "loadingScanEndTime", "loadCount", "loadingScanTotalTimeShow", "scanTime",
@@ -427,10 +431,10 @@ MAIN_TRACKING_COLUMNS = [
     "unLoadCount", "unLoadingScanTotalTimeShow", "unLoadTime", "vehiclelineCode",
     "vehiclelineName", "isAssistLine", "vehicleTypegroup", "vehicletypeName",
     "loadWeight", "loadCapacity", "vehicleDoorCnt", "mileage", "overtimeType",
-    "overtimeReasons", "quotationModel", "freightCode", "arriveProvince",
-    "oriRegShiftCarrierName", "auditStatus", "auditRemark", "auditer",
+    "overtimeReasons",
 ]
 
+# คอลัมน์ของเมนู "รายงานขนส่งรวมสายย่อย" (支线运输综合报表 / transportSynthesizeReport)
 BRANCH_TRACKING_COLUMNS = [
     "shipmentNo", "shipmentState", "shipmentName", "shipRegionName",
     "refLineRegionName", "sendRegionName", "arriveRegionName",
@@ -450,6 +454,41 @@ BRANCH_TRACKING_COLUMNS = [
     "unLoadingScanTotalTime",
 ]
 
+def _jms_headers(auth_token: str, extra: dict = None) -> dict:
+    """Headers ชุดเดียวกับที่เบราว์เซอร์ส่งไปยัง JMS
+
+    ``lang`` / ``langtype`` คือตัวที่ทำให้ JMS คืนหัวคอลัมน์เป็นภาษาไทย
+    และ ``timezone`` ทำให้ตีความช่วงเวลาเป็น GMT+7 — ถ้าขาดไป ไฟล์ที่
+    export ออกมาจะได้หัวคอลัมน์ภาษาจีน
+    """
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "authToken": auth_token,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.8",
+        "Cache-Control": "max-age=2, must-revalidate",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+        ),
+        "lang": "TH",
+        "langtype": "TH",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-GPC": "1",
+        "sec-ch-ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Brave";v="152"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "timezone": "GMT+0700",
+        "origin": "https://jms.jtexpress.co.th",
+        "referer": "https://jms.jtexpress.co.th/",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def export_jms_excel(auth_token: str, save_folder: str, filename: str, start_time: str, end_time: str, stop_checker, log) -> str:
     auth_token = clean_text(auth_token)
     if not auth_token:
@@ -463,7 +502,9 @@ def export_jms_excel(auth_token: str, save_folder: str, filename: str, start_tim
         filename += ".xlsx"
 
     base = "https://jmsgw.jtexpress.co.th/transportation"
-    headers = {"Content-Type": "application/json;charset=UTF-8", "authtoken": auth_token}
+    export_path = "/tmsExportTransportReport/reportExport"
+    export_task_url = f"/transportation{export_path}"
+    headers = _jms_headers(auth_token)
     payload = {
         "current": 1,
         "size": 100,
@@ -478,9 +519,10 @@ def export_jms_excel(auth_token: str, save_folder: str, filename: str, start_tim
     }
 
     log(f"สร้างงาน Export Main Transport: {start_time} → {end_time}")
+    job_started_at = (datetime.now() - timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
 
     def create_job():
-        res = requests.post(f"{base}/tmsExportTransportReport/reportExport", json=payload, headers=headers, timeout=30)
+        res = requests.post(f"{base}{export_path}", json=payload, headers=headers, timeout=30)
         res.raise_for_status()
         return res
 
@@ -488,20 +530,31 @@ def export_jms_excel(auth_token: str, save_folder: str, filename: str, start_tim
     time.sleep(5)
 
     task = None
-    for _ in range(30):
+    for _ in range(60):
         if stop_checker():
             log("หยุด Export JMS ตามคำสั่งผู้ใช้")
             return ""
         time.sleep(1)
 
         def get_tasks():
-            res = requests.post(f"{base}/export/selectTask", json={"current": 1, "size": 20}, headers=headers, timeout=30)
+            task_payload = {
+                "current": 1,
+                "size": 20,
+                "countryId": "1",
+                "startTime": datetime.now().strftime("%Y-%m-%d 00:00:00"),
+                "endTime": datetime.now().strftime("%Y-%m-%d 23:59:59"),
+                "exportUrls": [export_task_url],
+            }
+            res = requests.post(f"{base}/export/selectTask", json=task_payload, headers=headers, timeout=30)
             res.raise_for_status()
             return res.json()
 
         data = request_with_retry(get_tasks, log=log, name="Check JMS export task")
         for row in data.get("data", {}).get("records", []):
-            if row.get("state") == 2 and row.get("ossUrl"):
+            create_time = row.get("createTime") or ""
+            is_current_job = not create_time or create_time >= job_started_at
+            # ผูกกับ task ของ Main เท่านั้น ไม่งั้นอาจไปหยิบไฟล์ของ Branch มาแทน
+            if row.get("state") == 2 and row.get("ossUrl") and row.get("url") == export_task_url and is_current_job:
                 task = row
                 break
         if task:
@@ -548,18 +601,11 @@ def export_branch_tracking(
         filename += ".xlsx"
 
     base = "https://jmsgw.jtexpress.co.th/transportation"
-    export_url = "/transportation/tmsExportTransportReport/branchReportExport"
+    export_path = "/tmsExportTransportReport/branchReportExport"
+    export_task_url = f"/transportation{export_path}"
     export_task_name = "支线运输综合报表导出"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authtoken": auth_token,
-        "lang": "TH",
-        "langtype": "TH",
-        "routename": "transportSynthesizeReport",
-        "origin": "https://jms.jtexpress.co.th",
-        "referer": "https://jms.jtexpress.co.th/",
-    }
-    count_payload = {
+    headers = _jms_headers(auth_token, {"routeName": "transportSynthesizeReport"})
+    search_payload = {
         "current": 1,
         "size": 100,
         "timeType": 1,
@@ -574,18 +620,38 @@ def export_branch_tracking(
         "sendRegionalAgentList": [],
         "source": 2,
     }
+
+    def get_branch_record_count():
+        res = requests.post(
+            f"{base}/tmsBranchShipmentEvent/report",
+            json=search_payload,
+            headers=headers,
+            timeout=60,
+        )
+        res.raise_for_status()
+        data = res.json()
+        if not data.get("succ", False) or not data.get("data"):
+            raise RuntimeError(f"Search Branch data failed: {data}")
+        return int(data["data"].get("total", 0) or 0)
+
+    total_records = request_with_retry(
+        get_branch_record_count, log=log, name="Count Branch report records"
+    )
     payload = {
-        **count_payload,
+        **search_payload,
+        "count": total_records,
         "columnList": BRANCH_TRACKING_COLUMNS,
     }
 
-    log(f"สร้างงาน Export Branch Transport: {start_time} → {end_time}")
+    log(f"สร้างงาน Export Branch Transport: {start_time} → {end_time} ({total_records} รายการ)")
     job_started_at = (datetime.now() - timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
 
     def create_job():
         res = requests.post(
-            f"{base}/tmsExportTransportReport/branchReportExport",
-            json=payload,
+            f"{base}{export_path}",
+            # JMS ตรวจ payload ของ endpoint นี้เข้มงวด — เบราว์เซอร์ส่ง JSON แบบไม่มีช่องว่าง
+            # จึงต้องคุม wire format เอง แทนที่จะใช้ ``json=`` ของ requests
+            data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
             headers=headers,
             timeout=60,
         )
@@ -609,7 +675,7 @@ def export_branch_tracking(
                 "countryId": "1",
                 "startTime": datetime.now().strftime("%Y-%m-%d 00:00:00"),
                 "endTime": datetime.now().strftime("%Y-%m-%d 23:59:59"),
-                "exportUrls": [export_url],
+                "exportUrls": [export_task_url],
             }
             res = requests.post(f"{base}/export/selectTask", json=task_payload, headers=headers, timeout=60)
             res.raise_for_status()
@@ -619,7 +685,7 @@ def export_branch_tracking(
         for row in data.get("data", {}).get("records", []):
             create_time = row.get("createTime") or ""
             is_current_job = not create_time or create_time >= job_started_at
-            if row.get("state") == 2 and row.get("ossUrl") and row.get("url") == export_url and is_current_job:
+            if row.get("state") == 2 and row.get("ossUrl") and row.get("url") == export_task_url and is_current_job:
                 task = row
                 break
         if task:
@@ -686,8 +752,10 @@ class App(ctk.CTk):
         self.feishu_jobs = []
         self.feishu_job_widgets = []
         self.feishu_jobs_frame = None
+        self._applied_cycle = None
         self._build_ui()
         self._load_values_to_ui()
+        self._watch_cycle_rollover()
 
     # ---------- UI helpers ----------
     def _build_ui(self):
@@ -877,7 +945,8 @@ class App(ctk.CTk):
         date_card.grid(row=2, column=0, sticky="ew", padx=20, pady=8)
         date_card.grid_columnconfigure(7, weight=1)
 
-        self._label(date_card, "DATE RANGE", size=10, weight="bold", color=self.C["muted"]).grid(
+        self._label(date_card, "DATE RANGE  (เส้นรอง = ช่วงนี้ / เส้นหลัก = ย้อนหลัง 1 วัน)",
+                    size=10, weight="bold", color=self.C["muted"]).grid(
             row=0, column=0, columnspan=8, sticky="w", padx=18, pady=(14, 2))
 
         # Start
@@ -1524,7 +1593,6 @@ class App(ctk.CTk):
     # ---------- Config ----------
     def _load_values_to_ui(self):
         s = self.cfg["SETTING"]
-        today = datetime.now().date()
         self.run_hour_interval.set(
             s.get("run_hour_interval", "1")
         )
@@ -1546,15 +1614,9 @@ class App(ctk.CTk):
             s.get("run_feishu_chat", "1") == "1"
         )
 
-        for widget, key, default_date in [
-            (self.start_date, "start_date", today),
-            (self.end_date, "end_date", today + timedelta(days=1)),
-        ]:
-            value = s.get(key, "")
-            try:
-                widget.set_date(datetime.strptime(value, "%Y-%m-%d").date() if value else default_date)
-            except Exception:
-                widget.set_date(default_date)
+        # วันที่คิดจากรอบปัจจุบันเสมอ ไม่ใช้ค่าที่ค้างใน config
+        # (เปิดโปรแกรมเมื่อไหร่ก็ได้ช่วงที่ถูกต้องทันที)
+        self.refresh_cycle_dates(log_change=False)
 
         for key, entry in self.widgets.items():
             entry.delete(0, "end")
@@ -1592,9 +1654,83 @@ class App(ctk.CTk):
     def get_setting(self, key: str) -> str:
         return self.cfg["SETTING"].get(key, DEFAULT_CONFIG.get(key, "")).strip()
 
-    def get_datetime_range(self):
-        start = f"{self.start_date.get_date()} {self.start_hour.get()}:00"
-        end = f"{self.end_date.get_date()} {self.end_hour.get()}:00"
+    def _cycle_dates(self, now: datetime = None):
+        """วันเริ่ม/วันจบของ "รอบ" ปัจจุบัน คิดจากเวลาจริง
+
+        หนึ่งรอบเริ่มที่ ``start_hour`` ของแต่ละวัน (ปกติ 12:00) — ถ้าตอนนี้ยังไม่ถึง
+        เวลานั้น แปลว่ายังอยู่ในรอบที่เริ่มเมื่อวาน วันจึงยังไม่ขยับจนกว่าจะพ้นเที่ยง
+        """
+        now = now or datetime.now()
+        try:
+            cutoff = datetime.strptime(self.start_hour.get() or "12:00", "%H:%M").time()
+        except ValueError:
+            cutoff = datetime.strptime("12:00", "%H:%M").time()
+        start = now.date() if now.time() >= cutoff else now.date() - timedelta(days=1)
+        return start, start + timedelta(days=1)
+
+    def refresh_cycle_dates(self, log_change: bool = True) -> bool:
+        """เลื่อนวันบน UI ให้ตรงกับรอบปัจจุบัน คืน ``True`` ถ้ามีการเปลี่ยน (main thread เท่านั้น)
+
+        ขยับเฉพาะตอน "รอบเปลี่ยน" จริง ๆ (พ้นเที่ยงเข้าวันใหม่ หรือเพิ่งเปิดโปรแกรม)
+        ถ้ารอบยังเป็นรอบเดิม จะไม่ไปทับวันที่ผู้ใช้ตั้งเองไว้ดึงข้อมูลย้อนหลัง
+        """
+        start, end = self._cycle_dates()
+        if self._applied_cycle == (start, end):
+            return False
+        self._applied_cycle = (start, end)
+        if (self.start_date.get_date(), self.end_date.get_date()) == (start, end):
+            return False
+        self.start_date.set_date(start)
+        self.end_date.set_date(end)
+        self.cfg["SETTING"]["start_date"] = str(start)
+        self.cfg["SETTING"]["end_date"] = str(end)
+        save_config(self.cfg)
+        if log_change:
+            self.write_log(f"เปลี่ยนรอบวันที่อัตโนมัติ: {start} → {end}")
+        return True
+
+    def _watch_cycle_rollover(self) -> None:
+        """เช็คทุก 60 วิว่าพ้นเที่ยงเข้ารอบใหม่หรือยัง เปิดโปรแกรมค้างไว้ข้ามวันก็ขยับให้เอง"""
+        try:
+            self.refresh_cycle_dates()
+        except Exception:
+            pass
+        self.after(60_000, self._watch_cycle_rollover)
+
+    def refresh_cycle_dates_threadsafe(self) -> None:
+        """เรียก :meth:`refresh_cycle_dates` บน main thread แล้วรอจนเสร็จ"""
+        if threading.current_thread() is threading.main_thread():
+            self.refresh_cycle_dates()
+            return
+        done = threading.Event()
+
+        def _apply():
+            try:
+                self.refresh_cycle_dates()
+            finally:
+                done.set()
+
+        self.after(0, _apply)
+        done.wait(timeout=5)
+
+    def get_datetime_range(self, day_offset: int = 0):
+        """ช่วงเวลาที่ใช้ยิง JMS โดยเลื่อนวันได้ด้วย ``day_offset``
+
+        ช่วงบน UI คือช่วงของ **เส้นรอง** (วันนี้ 12:00 → พรุ่งนี้ 12:00)
+        ส่วน **เส้นหลัก** ใช้ช่วงย้อนหลัง 1 วัน (เมื่อวาน 12:00 → วันนี้ 12:00)
+        จึงเรียกด้วย ``day_offset=MAIN_DAY_OFFSET``
+        """
+        shift = timedelta(days=day_offset)
+        start_datetime = datetime.strptime(
+            f"{self.start_date.get_date()} {self.start_hour.get()}:00",
+            "%Y-%m-%d %H:%M:%S",
+        ) + shift
+        start = start_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        end_datetime = datetime.strptime(
+            f"{self.end_date.get_date()} {self.end_hour.get()}:00",
+            "%Y-%m-%d %H:%M:%S",
+        ) + shift - timedelta(seconds=1)
+        end = end_datetime.strftime("%Y-%m-%d %H:%M:%S")
         return start, end
 
     # ---------- Log / State ----------
@@ -1691,10 +1827,10 @@ class App(ctk.CTk):
             ):
                 raise ValueError("กรุณาเลือกอย่างน้อย 1 งาน: Export JMS หรือ Feishu Chat")
 
-            # Main Line
+            # Main Line — ย้อนหลัง 1 วันจากช่วงบน UI (เมื่อวาน 12:00 → วันนี้ 12:00)
             if self.var_main_transport.get():
 
-                start, end = self.get_datetime_range()
+                start, end = self.get_datetime_range(day_offset=MAIN_DAY_OFFSET)
 
                 export_jms_excel(
                     auth_token=self.get_setting("jms_auth_token"),
@@ -1706,7 +1842,7 @@ class App(ctk.CTk):
                     log=self.write_log,
                 )
 
-            # Branch Line
+            # Branch Line — ใช้ช่วงบน UI ตรง ๆ (วันนี้ 12:00 → พรุ่งนี้ 12:00)
             if self.var_branch_transport.get():
 
                 start, end = self.get_datetime_range()
@@ -2207,6 +2343,9 @@ class App(ctk.CTk):
             self.write_log(
                 f"Auto run at {datetime.now().strftime('%H:%M:%S')}"
             )
+
+            # พ้นเที่ยงของอีกวันแล้วให้ขยับรอบวันที่เอง ก่อนเริ่มดึงข้อมูล
+            self.refresh_cycle_dates_threadsafe()
 
             self.run_selected_jobs()
 
