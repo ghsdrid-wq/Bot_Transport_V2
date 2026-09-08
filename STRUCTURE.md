@@ -17,7 +17,7 @@
 | ไฟล์ | หน้าที่ |
 |------|---------|
 | `Bot_Fei_Main.py` | **ตัวหลัก (~2,200 บรรทัด)** — UI + scheduler + Feishu (token, `send_feishu_image_by_chat_id`, `send_feishu_file_by_chat_id`) + export Main/Branch transport + job config (sheets/range/output หลายชุด). ทั้งสอง export ใช้ header ชุดเดียวกันจาก `_jms_headers()`, ถาม `total` จาก endpoint ค้นหาของเมนูก่อน แล้วค่อยสั่ง export และกรอง task ใน `/export/selectTask` ด้วย `url` + `createTime` ของตัวเอง |
-| `createpng.py` | Excel → PNG ด้วย win32com. มี `repoint_queries()` เขียน path ใน Power Query ให้ชี้ โฟลเดอร์ `jms_save_path` ก่อน refresh, `ExcelWatchdog` ฆ่า EXCEL.EXE เมื่อค้างเกินเวลา และ `_kill_excel()` เก็บกวาด process ผี |
+| `createpng.py` | Excel → PNG ด้วย win32com. มี `repoint_queries()` เขียน path ใน Power Query ให้ชี้ โฟลเดอร์ `jms_save_path`, `force_sync_refresh()` ปิด BackgroundQuery ก่อน refresh, `ExcelWatchdog` รายงานความคืบหน้าและฆ่า EXCEL.EXE เมื่อค้างเกินเวลา และ `_kill_excel()` เก็บกวาด process ผี |
 | `sendfeishu.py` | ส่ง Feishu แบบ webhook + HMAC (เหมือน `Bot_Transport`) |
 | `pyi_rth_tkinter_paths.py` | PyInstaller runtime hook แก้ path tkinter ตอน build เป็น exe |
 | `Excel/` | template: `1Main_Line_Transport_Report.xlsx`, `2Branch_Line_Transport_Report.xlsx`, `report.xlsx`, `Report2.xlsx` |
@@ -87,6 +87,16 @@
     → COM call บล็อก → Excel "ไม่มีการตอบสนอง" และบอทแขวนถาวร (ลูป `stop_checker` ไม่ถูกเรียกด้วยซ้ำ)
   - บนเครื่องเดิม path เก่ายังมีไฟล์ค้างอยู่ เลย refresh ผ่านแบบเงียบ ๆ **แต่อ่านข้อมูลเก่าผิดไฟล์**
   - แก้: `repoint_queries()` เขียน path ใหม่ทุกครั้งก่อน refresh (เปลี่ยนเฉพาะโฟลเดอร์ เก็บชื่อไฟล์เดิม)
+- **`BackgroundQuery = True` ทำให้ refresh ผ่าน COM ค้าง** — ค่าเริ่มต้นของ Power Query
+  `RefreshAll()` จะคืนค่าทันทีแล้วงานจริงไปทำเบื้องหลัง โค้ดต้องไปรอที่
+  `CalculateUntilAsyncQueriesDone()` ซึ่งค้างยาวเพราะ Mashup engine ไม่ส่งสัญญาณจบ
+  กลับมาในบริบท automation (กดรีเฟรชด้วยมือไม่เจอ เพราะ Excel มี message loop ของตัวเอง)
+  - อาการ: log หยุดที่ `Refreshing data...` แล้วไม่ไปต่อ แต่เปิดไฟล์เองกดรีเฟรชกลับผ่านปกติ
+  - แก้: `force_sync_refresh()` ปิด `BackgroundQuery` ทุก connection ก่อน `RefreshAll()`
+    ทำให้บล็อกจนจบจริง ไม่ต้องพึ่ง `CalculateUntilAsyncQueriesDone` เลย
+- **หน้าต่าง Excel ต้องอยู่ในจอตอน refresh** — โค้ดย้าย Excel ไป `-32000,-32000` เพื่อไม่ให้เกะกะ
+  แต่ dialog ที่เด้งระหว่าง refresh จะไปโผล่นอกจอด้วย มองไม่เห็นและกดไม่ได้
+  `_move_excel_onscreen()` ย้ายกลับเข้าจอช่วง refresh แล้วค่อยย้ายออกตอนถ่ายรูป
 - **modal dialog ของ Excel หลุด `DisplayAlerts` ได้** — ต้องตั้ง `AskToUpdateLinks=False` และ
   `AutomationSecurity=3` เพิ่ม และมี `ExcelWatchdog` ฆ่า process จาก thread อื่นเป็นทางหนีสุดท้าย
 - **retry ตอนเปิด Excel ต้องเก็บกวาดของเดิม** — `DispatchEx` อาจสำเร็จแล้วไปพังตอน set property

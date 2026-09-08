@@ -37,43 +37,114 @@ def _kill_excel(pid):
 
 
 class ExcelWatchdog:
-    """ฆ่า Excel ถ้าขั้นตอนหนึ่งค้างเกินเวลาที่กำหนด
+    """เฝ้าขั้นตอนที่บล็อกอยู่ — รายงานความคืบหน้า และฆ่า Excel ถ้าเกินเวลา
 
     Power Query / dialog ของ Excel เป็น modal — พอเด้งขึ้นมา COM call จะบล็อกค้าง
     ตรงนั้นเลย ลูป stop_checker ไม่ถูกเรียก บอทจึงแขวนถาวร ต้องฆ่า process
     จากอีก thread เท่านั้นถึงจะหลุด
+
+    ระหว่างรอจะ log ทุก ``heartbeat`` วินาที ให้แยกออกว่า "เครื่องช้ากำลังทำงานอยู่"
+    กับ "ค้างเพราะมี dialog รอ" ต่างกัน — ถ้าเห็นเวลาเดินแต่ไม่จบสักที ให้ไปดู
+    หน้าต่าง Excel ว่ามีอะไรรอให้กดอยู่
     """
 
-    def __init__(self, pid, seconds, step, log=None):
+    def __init__(self, pid, seconds, step, log=None, heartbeat=30):
         self.pid = pid
         self.seconds = seconds
         self.step = step
         self.log = log
+        self.heartbeat = heartbeat
         self.fired = False
-        self._timer = None
+        self._stop = threading.Event()
+        self._thread = None
 
-    def _fire(self):
-        self.fired = True
-        if self.log:
-            self.log(f"  ⚠ Excel ค้างเกิน {self.seconds}s ที่ขั้นตอน '{self.step}' — บังคับปิด Excel")
-        _kill_excel(self.pid)
+    def _run(self):
+        started = time.time()
+        while not self._stop.wait(self.heartbeat):
+            elapsed = int(time.time() - started)
+            if elapsed >= self.seconds:
+                self.fired = True
+                if self.log:
+                    self.log(
+                        f"  ⚠ '{self.step}' ค้างเกิน {self.seconds}s — บังคับปิด Excel"
+                    )
+                _kill_excel(self.pid)
+                return
+            if self.log:
+                self.log(
+                    f"     ...{self.step} ยังทำงานอยู่ {elapsed}s "
+                    f"(หมดเวลาที่ {self.seconds}s)"
+                )
 
     def __enter__(self):
         if self.pid and self.seconds:
-            self._timer = threading.Timer(self.seconds, self._fire)
-            self._timer.daemon = True
-            self._timer.start()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
         return self
 
     def __exit__(self, *exc):
-        if self._timer:
-            self._timer.cancel()
+        self._stop.set()
         if self.fired:
             raise RuntimeError(
                 f"[createpng] Excel ไม่ตอบสนองที่ขั้นตอน '{self.step}' "
-                f"(เกิน {self.seconds}s) — มักเกิดจาก Power Query หา source file ไม่เจอ"
+                f"(เกิน {self.seconds}s) — มักเกิดจาก Power Query หา source file ไม่เจอ "
+                f"หรือมี dialog ของ Excel รอให้กดอยู่"
             )
         return False
+
+
+def force_sync_refresh(wb, log=None):
+    """บังคับให้ทุก connection รีเฟรชแบบ synchronous คืนจำนวนที่ตั้งได้
+
+    ค่าเริ่มต้นของ Power Query คือ ``BackgroundQuery = True`` — สั่ง
+    ``RefreshAll()`` ผ่าน COM แล้วมันจะคืนค่าทันทีโดยงานจริงไปทำเบื้องหลัง
+    โค้ดจึงต้องไปรอที่ ``CalculateUntilAsyncQueriesDone()`` ซึ่งค้างได้ยาว
+    เพราะ Mashup engine ไม่ส่งสัญญาณจบกลับมาในบริบท automation
+    (กดรีเฟรชด้วยมือไม่เจอปัญหานี้ เพราะ Excel มี message loop ของตัวเอง)
+
+    ปิด BackgroundQuery ทิ้ง แล้ว ``RefreshAll()`` จะบล็อกจนรีเฟรชจบจริง
+    ไม่ต้องพึ่ง CalculateUntilAsyncQueriesDone เลย
+    """
+    changed = 0
+
+    try:
+        count = int(wb.Connections.Count)
+    except Exception:
+        count = 0
+
+    for i in range(1, count + 1):
+        try:
+            conn = wb.Connections(i)
+        except Exception:
+            continue
+        for attr in ("OLEDBConnection", "ODBCConnection"):
+            try:
+                sub_conn = getattr(conn, attr)
+            except Exception:
+                continue
+            try:
+                if sub_conn.BackgroundQuery:
+                    sub_conn.BackgroundQuery = False
+                    changed += 1
+                    if log:
+                        log(f"  ปิด BackgroundQuery: {conn.Name}")
+            except Exception:
+                pass
+
+    # บางไฟล์ผูก query ไว้ที่ ListObject ในชีตแทน
+    try:
+        for ws in wb.Worksheets:
+            for lo in ws.ListObjects:
+                try:
+                    if lo.QueryTable.BackgroundQuery:
+                        lo.QueryTable.BackgroundQuery = False
+                        changed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return changed
 
 
 def repoint_queries(wb, source_folder, log=None):
@@ -154,6 +225,25 @@ def _move_excel_offscreen(excel):
     _pump(0.2)
 
 
+def _move_excel_onscreen(excel):
+    """ย้าย Excel กลับเข้าจอ
+
+    ระหว่าง refresh, Power Query อาจเด้ง dialog (privacy level / ถามหาไฟล์ /
+    ขอสิทธิ์เข้าถึง data source) ซึ่งเป็น modal — ถ้าหน้าต่างยังอยู่ที่ -32000
+    dialog จะโผล่นอกจอ ผู้ใช้มองไม่เห็นและกดไม่ได้ กลายเป็นค้างแบบไม่มีเบาะแส
+    """
+    try:
+        excel.Visible     = True
+        excel.WindowState = 2       # xlNormal
+        excel.Left        = 80
+        excel.Top         = 80
+        excel.Width       = 900
+        excel.Height      = 620
+    except Exception:
+        pass
+    _pump(0.2)
+
+
 def _hide_from_taskbar(excel):
     """
     ซ่อน Excel ออกจาก Taskbar โดยใช้ WS_EX_TOOLWINDOW
@@ -198,7 +288,9 @@ def run_create(
     report_date=None,
     log=None,
     stop_checker=None,
-    source_folder=None
+    source_folder=None,
+    open_timeout=180,
+    refresh_timeout=600
 ):
     def write(msg):
         if log:
@@ -283,7 +375,7 @@ def run_create(
         write(f"  Excel PID  : {excel_pid or 'ไม่ทราบ'}")
 
         write("  Opening workbook...")
-        with ExcelWatchdog(excel_pid, 120, "เปิดไฟล์ Excel", write):
+        with ExcelWatchdog(excel_pid, open_timeout, "เปิดไฟล์ Excel", write):
             wb = excel.Workbooks.Open(
                 excel_path,
                 UpdateLinks=0,
@@ -321,13 +413,23 @@ def run_create(
             if fixed:
                 write(f"  แก้ path ของ query แล้ว {fixed} รายการ")
 
+        # โชว์หน้าต่างจริงระหว่าง refresh — ถ้า Power Query เด้ง dialog ผู้ใช้จะได้
+        # เห็นและกดตอบได้ (Excel จำคำตอบไว้ ครั้งต่อไปจะไม่ถามอีก)
+        # ถ้าปล่อยอยู่นอกจอ dialog จะซ่อนอยู่ตรงนั้นและค้างไปเรื่อย ๆ
+        _move_excel_onscreen(excel)
+
+        synced = force_sync_refresh(wb, log=write)
+
         write("  Refreshing data...")
-        with ExcelWatchdog(excel_pid, 300, "Refresh Power Query", write):
+        write("     (ถ้าค้างตรงนี้นาน ให้ดูที่หน้าต่าง Excel ว่ามี dialog รออยู่หรือไม่)")
+        with ExcelWatchdog(excel_pid, refresh_timeout, "Refresh Power Query", write):
             wb.RefreshAll()
-            try:
-                excel.CalculateUntilAsyncQueriesDone()
-            except Exception as e:
-                write(f"  CalculateUntilAsync warning: {e}")
+            if not synced:
+                # ปิด background ไม่สำเร็จ ก็ยังต้องรอแบบ async ตามเดิม
+                try:
+                    excel.CalculateUntilAsyncQueriesDone()
+                except Exception as e:
+                    write(f"  CalculateUntilAsync warning: {e}")
 
         # รอ Excel คำนวณเสร็จ (แบบ wait_excel ใน Createphoto.py)
         write("  Waiting for Excel to calculate...")
@@ -347,6 +449,7 @@ def run_create(
             time.sleep(0.5)
 
         _pump(1.0)
+        _move_excel_offscreen(excel)   # refresh เสร็จแล้ว ซ่อนกลับออกนอกจอ
 
         if should_stop():
             return

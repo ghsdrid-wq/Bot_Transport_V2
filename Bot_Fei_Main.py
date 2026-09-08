@@ -30,10 +30,11 @@ import requests
 from tkcalendar import DateEntry
 
 try:
-    from createpng import run_create, repoint_queries
+    from createpng import run_create, repoint_queries, force_sync_refresh
 except Exception as exc:  # pragma: no cover
     run_create = None
     repoint_queries = None
+    force_sync_refresh = None
     CREATEPNG_IMPORT_ERROR = exc
 else:
     CREATEPNG_IMPORT_ERROR = None
@@ -1962,11 +1963,19 @@ class App(ctk.CTk):
                 except Exception as exc:
                     self.write_log(f"แก้ path ของ Power Query ไม่สำเร็จ: {exc}", level="WARN")
 
+            synced = 0
+            if force_sync_refresh:
+                try:
+                    synced = force_sync_refresh(wb, log=self.write_log)
+                except Exception as exc:
+                    self.write_log(f"ปิด BackgroundQuery ไม่สำเร็จ: {exc}", level="WARN")
+
             wb.RefreshAll()
-            try:
-                excel.CalculateUntilAsyncQueriesDone()
-            except Exception as exc:
-                self.write_log(f"Excel refresh warning: {exc}", level="WARN")
+            if not synced:
+                try:
+                    excel.CalculateUntilAsyncQueriesDone()
+                except Exception as exc:
+                    self.write_log(f"Excel refresh warning: {exc}", level="WARN")
 
             deadline = time.time() + 180
             while time.time() < deadline:
