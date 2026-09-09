@@ -59,12 +59,22 @@ def _find_duration_column(df):
     return None, None
 
 
+def is_missing(value):
+    """เช็คค่าว่างให้ครอบคลุมทั้ง None, NaN และ pandas.NA
+
+    คอลัมน์ Int64 (ใบงาน/สแกน) เก็บค่าว่างเป็น ``pd.NA`` ซึ่งเอาไปใช้ใน ``if``
+    หรือ ``and``/``or`` ตรง ๆ ไม่ได้ — จะได้ TypeError "boolean value of NA is
+    ambiguous" ต้องผ่าน pd.isna() เท่านั้น
+    """
+    return value is None or bool(pd.isna(value))
+
+
 def hhmm(hours):
     """ทศนิยมชั่วโมง → ข้อความ ชม:นาที เช่น 0.55 → "0:33" และ 19.72 → "19:43"
 
     ทศนิยมชั่วโมงอ่านยากเวลาเทียบกันด้วยตา (0.55 กับ 33 นาที ไม่ได้เชื่อมกันในหัวทันที)
     """
-    if hours is None or hours != hours:
+    if is_missing(hours):
         return ""
     total = int(round(float(hours) * 60))
     return f"{total // 60}:{total % 60:02d}"
@@ -140,9 +150,26 @@ def load_tasks(store_folder):
     con = _connect(db)
     try:
         _ensure_tasks_table(con)
-        return pd.read_sql_query("SELECT task, line, hours FROM tasks", con)
+        return pd.read_sql_query("SELECT task, line, hours, ended FROM tasks", con)
     finally:
         con.close()
+
+
+def _unattributed(tasks, scanned_tasks, start_time, end_time):
+    """เวลาของใบที่ลงของเสร็จในช่วงนี้ แต่ไม่มีสแกน DWS ให้รู้ว่าอยู่ช่องไหน
+
+    คืน (ชั่วโมงรวม, จำนวนใบ) — ทำให้ยอดรวมของรายงานไม่หายไปเงียบ ๆ
+    """
+    if tasks.empty or "ended" not in tasks.columns:
+        return 0.0, 0
+    ended = pd.to_datetime(tasks["ended"], errors="coerce")
+    inwin = ended.notna()
+    if start_time:
+        inwin &= ended >= pd.Timestamp(start_time)
+    if end_time:
+        inwin &= ended <= pd.Timestamp(end_time)
+    rest = tasks[inwin & ~tasks["task"].isin(scanned_tasks)]
+    return float(rest["hours"].sum()), int(rest["task"].nunique())
 
 
 def build_summary(store_folder, start_time=None, end_time=None, split="scans"):
@@ -150,10 +177,11 @@ def build_summary(store_folder, start_time=None, end_time=None, split="scans"):
     scans = load_scans(store_folder, start_time, end_time)
     tasks = load_tasks(store_folder)
 
-    detail = scans.merge(tasks, on="task", how="left")
+    detail = scans.merge(tasks.drop(columns=["ended"]), on="task", how="left")
     if detail.empty:
         empty = pd.DataFrame()
-        return pd.DataFrame(index=pd.Index(range(1, 12), name="ช่อง DWS")), empty, empty
+        idx = [f"DWS {i}" for i in range(1, 12)]
+        return pd.DataFrame(index=pd.Index(idx, name="DWS")), empty, empty
 
     total_scans = detail.groupby("task")["scans"].transform("sum")
     bay_count = detail.groupby("task")["bay"].transform("size")
@@ -185,22 +213,32 @@ def build_summary(store_folder, start_time=None, end_time=None, split="scans"):
     # จะถูกคูณต่อและสะสมขึ้นเมื่อมีใบงานเยอะ
     summary["ชิ้นต่อชั่วโมง"] = (summary["สแกน"] / summary["เวลารวม"]).round(0)
     summary = summary[["ใบงาน", "เวลารวม", "สแกน", "ชิ้นต่อชั่วโมง"]]
-    summary.index.name = "ช่อง DWS"
+    summary.index = [f"DWS {i}" for i in summary.index]
+
+    # ใบที่ลงของเสร็จในช่วงนี้แต่ไม่มีสแกน DWS เลย — รู้เวลาแต่ไม่รู้ว่าช่องไหน
+    # (เครื่องปิด / ฟีดไม่มา / เก็บข้อมูลไม่ทัน) ไม่เอาลงตาราง แต่แนบไว้ใน attrs
+    # เพื่อใช้เป็นตัวชี้วัดว่าเก็บข้อมูลได้ครบแค่ไหน
+    unknown_hours, unknown_tasks = _unattributed(tasks, set(scans["task"]), start_time, end_time)
+    summary["ใบงาน"] = summary["ใบงาน"].astype("Int64")
+    summary["สแกน"] = summary["สแกน"].astype("Int64")
+    summary.index.name = "DWS"
+    summary.attrs["unattributed_hours"] = unknown_hours
+    summary.attrs["unattributed_tasks"] = unknown_tasks
 
     detail = detail.rename(columns={
-        "task": "หมายเลขใบงาน", "bay": "ช่อง", "scans": "จำนวนสแกน",
+        "task": "หมายเลขใบงาน", "bay": "DWS", "scans": "จำนวนสแกน",
         "line": "เส้นทาง", "hours": "เวลาลงพัสดุ(ชม.)",
-        "share": "สัดส่วนที่แบ่งให้ช่องนี้", "hours_bay": "เวลาที่นับให้ช่องนี้(ชม.)",
-        "multi": "ลงหลายช่อง",
+        "share": "สัดส่วนที่แบ่งให้ DWS นี้", "hours_bay": "เวลาที่นับให้ DWS นี้(ชม.)",
+        "multi": "ลงหลาย DWS",
     })
     # ใส่คอลัมน์อ่านง่ายคู่กับทศนิยมไว้ตรวจย้อนกลับ
     detail.insert(
-        detail.columns.get_loc("เวลาที่นับให้ช่องนี้(ชม.)") + 1,
-        "เวลาที่นับให้ช่องนี้ (ชม:นาที)",
-        detail["เวลาที่นับให้ช่องนี้(ชม.)"].map(hhmm),
+        detail.columns.get_loc("เวลาที่นับให้ DWS นี้(ชม.)") + 1,
+        "เวลาที่นับให้ DWS นี้ (ชม:นาที)",
+        detail["เวลาที่นับให้ DWS นี้(ชม.)"].map(hhmm),
     )
     missing = missing.rename(columns={
-        "task": "หมายเลขใบงาน", "bay": "ช่อง", "scans": "จำนวนสแกน",
+        "task": "หมายเลขใบงาน", "bay": "DWS", "scans": "จำนวนสแกน",
     })
     return summary, detail, missing
 
@@ -224,7 +262,7 @@ def _style_summary_sheet(ws, n_rows, meta_start=None):
     ws.row_dimensions[1].height = 32
 
     for row in ws.iter_rows(min_row=2, max_row=n_rows + 1):
-        idle = row[1].value is None          # ช่องที่ไม่ได้ใช้งาน
+        idle = all(c.value is None for c in row[1:])   # ไม่ได้ใช้งานในช่วงนี้
         for cell in row:
             cell.font = body_font
             cell.border = border
@@ -242,7 +280,7 @@ def _style_summary_sheet(ws, n_rows, meta_start=None):
             cell.value = float(cell.value) / 24.0
             cell.number_format = "[h]:mm"
 
-    for col, width in zip("ABCDE", (11, 9, 13, 11, 15)):
+    for col, width in zip("ABCDE", (13, 9, 13, 11, 15)):
         ws.column_dimensions[col].width = width
 
     if meta_start:

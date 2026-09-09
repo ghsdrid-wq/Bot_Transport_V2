@@ -2272,17 +2272,36 @@ class App(ctk.CTk):
         total = detail["หมายเลขใบงาน"].nunique()
 
         self.write_log("── DWS: เวลาลงพัสดุรวมแยกตามช่อง ─────────")
-        for bay, row in summary.iterrows():
-            hours = row["เวลารวม"]
-            if hours is None or hours != hours:   # NaN = ช่องที่ไม่ได้ใช้งาน
+        for name, row in summary.iterrows():
+            hours, scans = row["เวลารวม"], row["สแกน"]
+            has_time = not dws_report.is_missing(hours)
+            has_scans = not dws_report.is_missing(scans)
+            if not has_time and not has_scans:
                 continue
-            self.write_log(
-                f"  ช่อง {bay:>2}: {dws_report.hhmm(hours):>7} ชม:นาที | "
-                f"{row['ใบงาน']:>3} ใบงาน | {row['สแกน']:>7,} ชิ้น"
-            )
+            if has_time:
+                jobs = "" if dws_report.is_missing(row["ใบงาน"]) else f"{int(row['ใบงาน'])}"
+                pieces = f"{int(scans):,}" if has_scans else ""
+                self.write_log(
+                    f"  {name:>10}: {dws_report.hhmm(hours):>7} ชม:นาที | "
+                    f"{jobs:>3} ใบงาน | {pieces:>7} ชิ้น"
+                )
+            else:
+                self.write_log(
+                    f"  {name:>10}: {'':>7}         | {'':>3}       | {int(scans):>7,} ชิ้น"
+                )
         grand = summary["เวลารวม"].sum()
         self.write_log(f"  รวมทุกช่อง {dws_report.hhmm(grand)} ชม:นาที "
                        f"| จับคู่ใบงานได้ {matched}/{total}")
+
+        # ใบที่รู้เวลาแต่ไม่รู้ช่อง ไม่เอาลงตาราง แต่บอกใน log ไว้ดูสุขภาพฟีดข้อมูล
+        unknown = summary.attrs.get("unattributed_hours", 0)
+        if unknown:
+            share = unknown / (grand + unknown) * 100
+            self.write_log(
+                f"  (ยังระบุช่องไม่ได้อีก {dws_report.hhmm(unknown)} ชม:นาที จาก "
+                f"{summary.attrs.get('unattributed_tasks', 0)} ใบ = {share:.0f}% "
+                f"— ปกติแปลว่าฟีดของบางช่องยังมาไม่ครบ)"
+            )
 
         output = os.path.join(folder, "DWS_Report.xlsx")
         dws_report.write_excel(output, summary, detail, missing, meta={
@@ -2302,7 +2321,7 @@ class App(ctk.CTk):
         image_path = os.path.join(png_folder, "dws_report.png")
         try:
             run_create(
-                excel_path=output, sheet_name="1", cell_range="A1:E12",   # เฉพาะตาราง 11 ช่อง + หัวตาราง ไม่เอาบล็อก meta ข้างล่าง
+                excel_path=output, sheet_name="1", cell_range="A1:E12",   # หัวตาราง + ช่อง 1-11
                 output_path=image_path,
                 report_date=None,          # ห้ามเขียนทับ B2 ของชีตสรุป
                 log=self.write_log,
