@@ -30,6 +30,16 @@ import requests
 from tkcalendar import DateEntry
 
 try:
+    import dws_collect
+    import dws_report
+except Exception as exc:  # pragma: no cover
+    dws_collect = None
+    dws_report = None
+    DWS_IMPORT_ERROR = exc
+else:
+    DWS_IMPORT_ERROR = None
+
+try:
     from createpng import run_create, repoint_queries, force_sync_refresh
 except Exception as exc:  # pragma: no cover
     run_create = None
@@ -46,7 +56,8 @@ LOG_FILE = "bot_fei_main.log"
 MINUTES = [str(i) for i in range(60)]
 RUN_HOURS = [str(i) for i in range(1, 25)]
 
-HOURS = [f"{i:02d}:00" for i in range(24)]
+# ทีละครึ่งชั่วโมง — รอบวันตัดที่ 01:30 (รถของวันหมดช่วงนั้น) เลือกชั่วโมงเต็มอย่างเดียวไม่พอ
+HOURS = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 
 
 # =========================
@@ -66,13 +77,34 @@ DEFAULT_CONFIG = {
     # Home / Scheduler
     "run_hour_interval": "1",
     "run_minute_interval": "5",
+    # ช่วงเวลาของแต่ละเส้น — ขอบช่วงเป็น 12:00 ทั้งคู่ ต่างกันที่ "วันพลิกตอนไหน"
+    # start_date/end_date = เส้นรอง (ชื่อเดิม เก็บไว้ให้ config เก่าใช้ต่อได้)
     "start_date": "",
     "end_date": "",
-    "start_hour": "13:00",
-    "end_hour": "23:00",
+    "start_hour": "12:00",
+    "end_hour": "12:00",
+    "main_start_date": "",
+    "main_end_date": "",
+    "branch_start_hour": "12:00",
+    "branch_end_hour": "12:00",
     "run_main_transport": "1",
     "run_branch_transport": "1",
     "run_feishu_chat": "1",
+    "run_dws_report": "0",
+
+    # DWS — path ไฟล์ realtime ของแต่ละช่อง
+    # ช่อง 1-8 เป็น share ของเครื่องนั้น ๆ (IP = 10.30.32.(31+N))
+    # ช่อง 9-11 เป็นไฟล์รวมที่ bot อีกตัวสร้างไว้ในเครื่องนี้ แยกช่องด้วย IP ข้างใน
+    "dws1_path": r"\\10.30.32.32\users\admin\desktop\report\realtime\dws1.xlsx",
+    "dws2_path": r"\\10.30.32.33\users\admin\desktop\report\realtime\dws2.xlsx",
+    "dws3_path": r"\\10.30.32.34\users\admin\desktop\report\dws3\realtime\dws3.xlsx",
+    "dws4_path": r"\\10.30.32.35\users\admin\desktop\report\realtime\dws4.xlsx",
+    "dws5_path": r"\\10.30.32.36\users\shzto\desktop\report\realtime\dws5.xlsx",
+    "dws6_path": r"\\10.30.32.37\users\admin\desktop\report\realtime\dws6.xlsx",
+    "dws7_path": r"\\10.30.32.38\users\admin\desktop\report\dws7\realtime\dws7.xlsx",
+    "dws8_path": r"\\10.30.32.39\users\admin\desktop\report\dws8\realtime\dws8.xlsx",
+    "dws9_11_path": "",
+    "dws_store_path": "",
 
     # JMS Export
     "jms_auth_token": "",
@@ -148,9 +180,19 @@ def load_config() -> configparser.ConfigParser:
             "end_date": "end_date",
             "start_hour": "start_hour",
             "end_hour": "end_hour",
+            "main_start_date": "main_start_date",
+            "main_end_date": "main_end_date",
+            "branch_start_hour": "branch_start_hour",
+            "branch_end_hour": "branch_end_hour",
             "run_main_transport": "run_main_transport",
             "run_branch_transport": "run_branch_transport",
             "run_feishu_chat": "run_feishu_chat",
+            "run_dws_report": "run_dws_report",
+        },
+        "DWS": {
+            **{f"dws{i}_path": f"dws{i}_path" for i in range(1, 9)},
+            "dws9_11_path": "dws9_11_path",
+            "dws_store_path": "dws_store_path",
         },
         "JMS": {
             "auth_token": "jms_auth_token",
@@ -210,16 +252,38 @@ def _write_pretty_config(cfg: configparser.ConfigParser) -> None:
         f"run_hour_interval = {s.get('run_hour_interval', DEFAULT_CONFIG['run_hour_interval'])}",
         f"run_minute_interval = {s.get('run_minute_interval', DEFAULT_CONFIG['run_minute_interval'])}",
         "",
-        "# Date Range",
-        f"start_date = {s.get('start_date', '')}",
-        f"end_date = {s.get('end_date', '')}",
+        "# Date Range — เส้นหลักกับเส้นรองเป็นคนละรอบ พลิกวันคนละเวลา",
+        "# เส้นหลัก: เมื่อวาน 12:00 -> วันนี้ 12:00   พลิกวันตอน 01:30",
+        f"main_start_date = {s.get('main_start_date', '')}",
+        f"main_end_date = {s.get('main_end_date', '')}",
         f"start_hour = {s.get('start_hour', DEFAULT_CONFIG['start_hour'])}",
         f"end_hour = {s.get('end_hour', DEFAULT_CONFIG['end_hour'])}",
+        "",
+        "# เส้นรอง: วันนี้ 12:00 -> พรุ่งนี้ 12:00   พลิกวันตอน 12:00",
+        f"start_date = {s.get('start_date', '')}",
+        f"end_date = {s.get('end_date', '')}",
+        f"branch_start_hour = {s.get('branch_start_hour', DEFAULT_CONFIG['branch_start_hour'])}",
+        f"branch_end_hour = {s.get('branch_end_hour', DEFAULT_CONFIG['branch_end_hour'])}",
         "",
         "# Jobs",
         f"run_main_transport = {s.get('run_main_transport', DEFAULT_CONFIG['run_main_transport'])}",
         f"run_branch_transport = {s.get('run_branch_transport', DEFAULT_CONFIG['run_branch_transport'])}",
         f"run_feishu_chat = {s.get('run_feishu_chat', DEFAULT_CONFIG['run_feishu_chat'])}",
+        f"run_dws_report = {s.get('run_dws_report', DEFAULT_CONFIG['run_dws_report'])}",
+        "",
+        "",
+        "[DWS]",
+        "",
+        "# path ไฟล์ realtime ของแต่ละช่อง — เว้นว่างได้ถ้าเครื่องนั้นไม่ได้ใช้งาน",
+    ] + [
+        f"dws{i}_path = {s.get(f'dws{i}_path', '')}" for i in range(1, 9)
+    ] + [
+        "",
+        "# ไฟล์รวมของช่อง 9-11 (แยกช่องด้วย IP ในคอลัมน์ dws序号)",
+        f"dws9_11_path = {s.get('dws9_11_path', '')}",
+        "",
+        "# คลังสะสมข้อมูลสแกน — ไฟล์ realtime เก็บย้อนหลังแค่ 24 ชม. ต้องอ่านสะสมไว้เอง",
+        f"dws_store_path = {s.get('dws_store_path', '')}",
         "",
         "",
         "[JMS]",
@@ -414,8 +478,13 @@ def send_feishu_file_by_chat_id(token: str, chat_id: str, file_key: str, log=Non
 # C) JMS EXPORT MODULE
 # =========================
 # เส้นหลักดึงข้อมูลย้อนหลัง 1 วันจากช่วงที่เลือกบน UI
-# (UI = ช่วงของเส้นรอง: วันนี้ 12:00 → พรุ่งนี้ 12:00, เส้นหลัก: เมื่อวาน 12:00 → วันนี้ 12:00)
-MAIN_DAY_OFFSET = -1
+# (UI = ช่วงของเส้นรอง: วันนี้ 01:30 → พรุ่งนี้ 01:30, เส้นหลัก: เมื่อวาน 01:30 → วันนี้ 01:30)
+# เส้นหลัก: เตรียมรถเมื่อวาน 12:00 → วันนี้ 12:00 ลงของหมดไม่เกินตี 1
+#           พอถึง 01:30 ข้อมูลรอบนั้นครบแล้ว จึงพลิกไปรอบถัดไป
+# เส้นรอง:  เตรียมรถวันนี้ 12:00 → พรุ่งนี้ 12:00 ลงของหมดไม่เกินเที่ยงของอีกวัน
+#           จึงพลิกวันตอน 12:00 ตามปกติ
+MAIN_ROLLOVER = "01:30"
+BRANCH_ROLLOVER = "12:00"
 
 MAIN_TRACKING_COLUMNS = [
     "shipmentNo", "shipmentName", "gxType", "shipmentState", "shifts",
@@ -751,10 +820,13 @@ class App(ctk.CTk):
         logging.basicConfig(filename=resource_path(LOG_FILE), level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", encoding="utf-8")
 
         self.widgets = {}
+        self.date_widgets = {}
+        self.hour_widgets = {}
         self.feishu_jobs = []
         self.feishu_job_widgets = []
         self.feishu_jobs_frame = None
-        self._applied_cycle = None
+        self._applied_cycle = {}
+        self._ready = False   # กันบันทึก config ก่อนโหลดค่าเสร็จ
         self._build_ui()
         self._load_values_to_ui()
         self._watch_cycle_rollover()
@@ -903,6 +975,7 @@ class App(ctk.CTk):
         self.var_main_transport = ctk.BooleanVar(value=True)
         self.var_branch_transport = ctk.BooleanVar(value=True)
         self.var_feishu = ctk.BooleanVar(value=True)
+        self.var_dws = ctk.BooleanVar(value=False)
         chk_style = dict(
             font=ctk.CTkFont(size=13),
             checkbox_width=18, checkbox_height=18,
@@ -931,7 +1004,14 @@ class App(ctk.CTk):
             text="Feishu Chat",
             variable=self.var_feishu,
             **chk_style
-        ).grid(row=0, column=8, padx=(0,8), pady=16)
+        ).grid(row=0, column=8, padx=(0,10), pady=16)
+
+        ctk.CTkCheckBox(
+            ctrl,
+            text="DWS Report",
+            variable=self.var_dws,
+            **chk_style
+        ).grid(row=0, column=9, padx=(0,8), pady=16)
 
         # column=8 = spacer (weight=1)
 
@@ -943,50 +1023,34 @@ class App(ctk.CTk):
         self.btn_run.grid(row=0, column=11, padx=(0, 18), pady=16)
 
         # ── Date range card ────────────────────────────────────────
+        # เส้นหลักกับเส้นรองเป็นคนละรอบกัน จึงต้องมีตัวกรองเวลาแยกกัน 2 ชุด
+        #   เส้นหลัก  เตรียมรถ เมื่อวาน 12:00 → วันนี้ 12:00 ลงของหมดไม่เกินตี 1
+        #             → พลิกวันตอน 01:30
+        #   เส้นรอง   เตรียมรถ วันนี้ 12:00 → พรุ่งนี้ 12:00 ลงของหมดไม่เกินเที่ยงอีกวัน
+        #             → พลิกวันตอน 12:00
         date_card = self._card(parent)
         date_card.grid(row=2, column=0, sticky="ew", padx=20, pady=8)
-        date_card.grid_columnconfigure(7, weight=1)
+        date_card.grid_columnconfigure(8, weight=1)
 
-        self._label(date_card, "DATE RANGE  (เส้นรอง = ช่วงนี้ / เส้นหลัก = ย้อนหลัง 1 วัน)",
-                    size=10, weight="bold", color=self.C["muted"]).grid(
+        self._label(date_card, "DATE RANGE", size=10, weight="bold", color=self.C["muted"]).grid(
             row=0, column=0, columnspan=8, sticky="w", padx=18, pady=(14, 2))
 
-        # Start
-        self._label(date_card, "Start", size=12, color=self.C["muted"]).grid(row=1, column=0, padx=(18, 6), pady=(4, 14), sticky="w")
-        self.start_date = DateEntry(
-            date_card, width=13, date_pattern="yyyy-mm-dd", state="readonly",
-            background="#1a2744", foreground="#e2e8f0",
-            selectbackground="#3b82f6", selectforeground="#ffffff",
-            font=("Segoe UI", 12),
+        self.main_date_widgets = self._date_range_row(
+            date_card, 1, "เส้นหลัก", "main_start_date", "main_end_date",
+            "start_hour", "end_hour", "พลิกวันตอน 01:30",
         )
-        self.start_date.grid(row=1, column=1, padx=4, pady=(4, 14))
-        self.start_hour = ctk.CTkComboBox(
-            date_card, values=HOURS, width=96, state="readonly",
-            fg_color=self.C["surface"], border_color=self.C["border"],
-            button_color=self.C["accent"], dropdown_fg_color=self.C["card"],
-            font=ctk.CTkFont(size=13),
+        self.branch_date_widgets = self._date_range_row(
+            date_card, 2, "เส้นรอง", "start_date", "end_date",
+            "branch_start_hour", "branch_end_hour", "พลิกวันตอน 12:00",
         )
-        self.start_hour.grid(row=1, column=2, padx=4, pady=(4, 14))
 
-        # Arrow
-        self._label(date_card, "→", size=16, color=self.C["accent2"]).grid(row=1, column=3, padx=12, pady=(4, 14))
-
-        # End
-        self._label(date_card, "End", size=12, color=self.C["muted"]).grid(row=1, column=4, padx=(0, 6), pady=(4, 14), sticky="w")
-        self.end_date = DateEntry(
-            date_card, width=13, date_pattern="yyyy-mm-dd", state="readonly",
-            background="#1a2744", foreground="#e2e8f0",
-            selectbackground="#3b82f6", selectforeground="#ffffff",
-            font=("Segoe UI", 12),
-        )
-        self.end_date.grid(row=1, column=5, padx=4, pady=(4, 14))
-        self.end_hour = ctk.CTkComboBox(
-            date_card, values=HOURS, width=96, state="readonly",
-            fg_color=self.C["surface"], border_color=self.C["border"],
-            button_color=self.C["accent"], dropdown_fg_color=self.C["card"],
-            font=ctk.CTkFont(size=13),
-        )
-        self.end_hour.grid(row=1, column=6, padx=4, pady=(4, 14))
+        # ชื่อเดิมที่โค้ดส่วนอื่นเรียกใช้ = ชุดของเส้นรอง (ช่วง "วันนี้" ตามที่ใช้มาตลอด)
+        self.start_date = self.branch_date_widgets["start_date"]
+        self.end_date = self.branch_date_widgets["end_date"]
+        self.start_hour = self.branch_date_widgets["start_hour"]
+        self.end_hour = self.branch_date_widgets["end_hour"]
+        self.main_start_date = self.main_date_widgets["start_date"]
+        self.main_end_date = self.main_date_widgets["end_date"]
 
         # Status pill
         self.status = ctk.CTkLabel(
@@ -996,7 +1060,7 @@ class App(ctk.CTk):
             text_color=self.C["muted"],
             anchor="w",
         )
-        self.status.grid(row=1, column=7, sticky="ew", padx=(16, 18), pady=(4, 14))
+        self.status.grid(row=1, column=8, rowspan=2, sticky="ew", padx=(16, 18), pady=(4, 14))
 
         # ── Live Log card ──────────────────────────────────────────
         log_card = self._card(parent)
@@ -1044,6 +1108,49 @@ class App(ctk.CTk):
             self.log_box.tag_config("START",   foreground="#67e8f9")
         except Exception:
             pass
+
+    def _date_range_row(self, parent, row, title, start_key, end_key,
+                        start_hour_key, end_hour_key, hint):
+        """สร้าง 1 แถวของตัวกรองเวลา: ชื่อ | Start [วัน][เวลา] → End [วัน][เวลา]"""
+        def date_entry(column):
+            widget = DateEntry(
+                parent, width=13, date_pattern="yyyy-mm-dd", state="readonly",
+                background="#1a2744", foreground="#e2e8f0",
+                selectbackground="#3b82f6", selectforeground="#ffffff",
+                font=("Segoe UI", 12),
+            )
+            widget.grid(row=row, column=column, padx=4, pady=(4, 10))
+            return widget
+
+        def hour_box(column, key):
+            widget = ctk.CTkComboBox(
+                parent, values=HOURS, width=90, state="readonly",
+                fg_color=self.C["surface"], border_color=self.C["border"],
+                button_color=self.C["accent"], dropdown_fg_color=self.C["card"],
+                font=ctk.CTkFont(size=13),
+                command=lambda _v: self.save_from_ui(silent=True),
+            )
+            widget.grid(row=row, column=column, padx=4, pady=(4, 10))
+            self.hour_widgets[key] = widget
+            return widget
+
+        self._label(parent, title, size=12, weight="bold", color=self.C["text"],
+                    width=64, anchor="w").grid(
+            row=row, column=0, padx=(18, 4), pady=(4, 10), sticky="w")
+
+        start_date = date_entry(1)
+        start_hour = hour_box(2, start_hour_key)
+        self._label(parent, "→", size=15, color=self.C["accent2"]).grid(
+            row=row, column=3, padx=8, pady=(4, 10))
+        end_date = date_entry(4)
+        end_hour = hour_box(5, end_hour_key)
+        self._label(parent, hint, size=11, color=self.C["muted"], anchor="w").grid(
+            row=row, column=6, columnspan=2, padx=(12, 4), pady=(4, 10), sticky="w")
+
+        self.date_widgets[start_key] = start_date
+        self.date_widgets[end_key] = end_date
+        return {"start_date": start_date, "end_date": end_date,
+                "start_hour": start_hour, "end_hour": end_hour}
 
     def _setting_entry(self, parent, row, label, key, browse=None, show=None):
         self._label(parent, label, size=12, color=self.C["muted"], width=160, anchor="w").grid(
@@ -1555,9 +1662,30 @@ class App(ctk.CTk):
         self._setting_entry(feishu, 3, "App Secret",     "app_secret",         show="*")
         self._setting_entry(feishu, 4, "Chat ID",        "chat_id")
 
+        # ── DWS card ────────────────────────────────────────────────
+        dws = self._card(scroll)
+        dws.grid(row=2, column=0, sticky="ew", padx=20, pady=8)
+        dws.grid_columnconfigure(1, weight=1)
+        self._section_title(dws, 0, "📦", "DWS — ช่องลงพัสดุ")
+        self._label(
+            dws,
+            "ชี้ไปที่ไฟล์ realtime ของแต่ละช่อง — เว้นว่างไว้ได้ถ้าเครื่องนั้นไม่ได้ใช้งาน",
+            size=12, color=self.C["muted"],
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 6))
+        for i in range(1, 9):
+            self._setting_entry(dws, 1 + i, f"ช่อง {i}", f"dws{i}_path", browse="file")
+        self._setting_entry(dws, 10, "ช่อง 9-11 (ไฟล์รวม)", "dws9_11_path", browse="file")
+        self._setting_entry(dws, 11, "คลังสะสมข้อมูล", "dws_store_path", browse="folder")
+        self._label(
+            dws,
+            "ไฟล์ realtime เก็บย้อนหลังแค่ 24 ชม. บอทจะอ่านสะสมลงคลังทุกรอบ "
+            "เว้นว่าง = ใช้โฟลเดอร์เดียวกับ JMS Save Path",
+            size=11, color=self.C["muted"],
+        ).grid(row=12, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 12))
+
         # ── Dynamic Excel Manager ───────────────────────────────────
         manager = self._card(scroll)
-        manager.grid(row=2, column=0, sticky="ew", padx=20, pady=8)
+        manager.grid(row=3, column=0, sticky="ew", padx=20, pady=8)
         manager.grid_columnconfigure(0, weight=1)
         top = ctk.CTkFrame(manager, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
@@ -1578,7 +1706,7 @@ class App(ctk.CTk):
 
         # ── Save button ─────────────────────────────────────────────
         btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=20, pady=(8, 28))
+        btn_row.grid(row=4, column=0, sticky="ew", padx=20, pady=(8, 28))
         self._btn(btn_row, "💾  Save Settings", self.save_from_ui, width=160).pack(side="left", padx=4)
 
     def _browse_to_entry(self, key: str, mode: str):
@@ -1602,8 +1730,10 @@ class App(ctk.CTk):
         self.run_minute_interval.set(
             s.get("run_minute_interval", "5")
         )
-        self.start_hour.set(s.get("start_hour", "12:00"))
-        self.end_hour.set(s.get("end_hour", "12:00"))
+        self.main_date_widgets["start_hour"].set(s.get("start_hour", "12:00"))
+        self.main_date_widgets["end_hour"].set(s.get("end_hour", "12:00"))
+        self.branch_date_widgets["start_hour"].set(s.get("branch_start_hour", "12:00"))
+        self.branch_date_widgets["end_hour"].set(s.get("branch_end_hour", "12:00"))
         self.var_main_transport.set(
             s.get("run_main_transport", "1") == "1"
         )
@@ -1616,9 +1746,9 @@ class App(ctk.CTk):
             s.get("run_feishu_chat", "1") == "1"
         )
 
-        # วันที่คิดจากรอบปัจจุบันเสมอ ไม่ใช้ค่าที่ค้างใน config
-        # (เปิดโปรแกรมเมื่อไหร่ก็ได้ช่วงที่ถูกต้องทันที)
-        self.refresh_cycle_dates(log_change=False)
+        self.var_dws.set(
+            s.get("run_dws_report", "0") == "1"
+        )
 
         for key, entry in self.widgets.items():
             entry.delete(0, "end")
@@ -1627,14 +1757,26 @@ class App(ctk.CTk):
         self._load_feishu_jobs_from_config()
         self._render_feishu_jobs()
 
+        # ต้องอยู่ท้ายสุด — refresh อาจสั่ง save_from_ui() ซึ่งอ่านค่าจากทุกช่อง
+        # ถ้าเรียกก่อนค่าลงช่องครบ จะเขียนช่องว่างทับ config ทั้งไฟล์
+        self._ready = True
+        self.refresh_cycle_dates(log_change=False)
+
     def save_from_ui(self, silent: bool = False):
+        # กันเขียนทับ config ด้วยค่าว่างระหว่างที่ UI ยังโหลดค่าไม่ครบ
+        if not getattr(self, "_ready", False):
+            return
         s = self.cfg["SETTING"]
         s["run_hour_interval"] = self.run_hour_interval.get()
         s["run_minute_interval"] = self.run_minute_interval.get()
-        s["start_date"] = str(self.start_date.get_date())
-        s["end_date"] = str(self.end_date.get_date())
-        s["start_hour"] = self.start_hour.get()
-        s["end_hour"] = self.end_hour.get()
+        s["start_date"] = str(self.branch_date_widgets["start_date"].get_date())
+        s["end_date"] = str(self.branch_date_widgets["end_date"].get_date())
+        s["branch_start_hour"] = self.branch_date_widgets["start_hour"].get()
+        s["branch_end_hour"] = self.branch_date_widgets["end_hour"].get()
+        s["main_start_date"] = str(self.main_date_widgets["start_date"].get_date())
+        s["main_end_date"] = str(self.main_date_widgets["end_date"].get_date())
+        s["start_hour"] = self.main_date_widgets["start_hour"].get()
+        s["end_hour"] = self.main_date_widgets["end_hour"].get()
         s["run_main_transport"] = (
             "1" if self.var_main_transport.get() else "0"
         )
@@ -1646,6 +1788,10 @@ class App(ctk.CTk):
         s["run_feishu_chat"] = (
             "1" if self.var_feishu.get() else "0"
         )
+
+        s["run_dws_report"] = (
+            "1" if self.var_dws.get() else "0"
+        )
         for key, entry in self.widgets.items():
             s[key] = entry.get().strip()
         self._save_feishu_jobs_to_config()
@@ -1656,40 +1802,58 @@ class App(ctk.CTk):
     def get_setting(self, key: str) -> str:
         return self.cfg["SETTING"].get(key, DEFAULT_CONFIG.get(key, "")).strip()
 
-    def _cycle_dates(self, now: datetime = None):
-        """วันเริ่ม/วันจบของ "รอบ" ปัจจุบัน คิดจากเวลาจริง
+    def _cycle_dates(self, now: datetime = None, rollover: str = BRANCH_ROLLOVER,
+                     lag_days: int = 0):
+        """วันเริ่ม/วันจบของรอบปัจจุบัน คิดจากเวลาจริง
 
-        หนึ่งรอบเริ่มที่ ``start_hour`` ของแต่ละวัน (ปกติ 12:00) — ถ้าตอนนี้ยังไม่ถึง
-        เวลานั้น แปลว่ายังอยู่ในรอบที่เริ่มเมื่อวาน วันจึงยังไม่ขยับจนกว่าจะพ้นเที่ยง
+        ``rollover`` คือเวลาที่ "วันพลิก" ของเส้นนั้น — ก่อนถึงเวลานี้ยังนับเป็น
+        รอบของเมื่อวาน ส่วน ``lag_days`` คือจำนวนวันที่ช่วงข้อมูลตามหลังวันพลิก
+
+        เส้นรอง  พลิก 12:00 lag 0 → รอบคือ วันนี้ 12:00 → พรุ่งนี้ 12:00
+        เส้นหลัก พลิก 01:30 lag 1 → รอบคือ เมื่อวาน 12:00 → วันนี้ 12:00
+                 (พอพ้น 01:30 ของวันถัดไป จึงขยับไปรอบใหม่)
         """
         now = now or datetime.now()
         try:
-            cutoff = datetime.strptime(self.start_hour.get() or "12:00", "%H:%M").time()
+            cutoff = datetime.strptime(rollover, "%H:%M").time()
         except ValueError:
-            cutoff = datetime.strptime("12:00", "%H:%M").time()
+            cutoff = datetime.strptime(BRANCH_ROLLOVER, "%H:%M").time()
         start = now.date() if now.time() >= cutoff else now.date() - timedelta(days=1)
+        start -= timedelta(days=lag_days)
         return start, start + timedelta(days=1)
 
-    def refresh_cycle_dates(self, log_change: bool = True) -> bool:
-        """เลื่อนวันบน UI ให้ตรงกับรอบปัจจุบัน คืน ``True`` ถ้ามีการเปลี่ยน (main thread เท่านั้น)
+    def _main_cycle_dates(self, now: datetime = None):
+        return self._cycle_dates(now, rollover=MAIN_ROLLOVER, lag_days=1)
 
-        ขยับเฉพาะตอน "รอบเปลี่ยน" จริง ๆ (พ้นเที่ยงเข้าวันใหม่ หรือเพิ่งเปิดโปรแกรม)
-        ถ้ารอบยังเป็นรอบเดิม จะไม่ไปทับวันที่ผู้ใช้ตั้งเองไว้ดึงข้อมูลย้อนหลัง
+    def _branch_cycle_dates(self, now: datetime = None):
+        return self._cycle_dates(now, rollover=BRANCH_ROLLOVER, lag_days=0)
+
+    def refresh_cycle_dates(self, log_change: bool = True) -> bool:
+        """เลื่อนวันของทั้งสองเส้นให้ตรงกับรอบปัจจุบัน (main thread เท่านั้น)
+
+        ขยับเฉพาะตอนรอบเปลี่ยนจริง ถ้ารอบยังเดิมจะไม่ไปทับวันที่ผู้ใช้ตั้งเอง
+        ไว้ดึงข้อมูลย้อนหลัง แต่ละเส้นพลิกคนละเวลาจึงเช็คแยกกัน
         """
-        start, end = self._cycle_dates()
-        if self._applied_cycle == (start, end):
-            return False
-        self._applied_cycle = (start, end)
-        if (self.start_date.get_date(), self.end_date.get_date()) == (start, end):
-            return False
-        self.start_date.set_date(start)
-        self.end_date.set_date(end)
-        self.cfg["SETTING"]["start_date"] = str(start)
-        self.cfg["SETTING"]["end_date"] = str(end)
-        save_config(self.cfg)
-        if log_change:
-            self.write_log(f"เปลี่ยนรอบวันที่อัตโนมัติ: {start} → {end}")
-        return True
+        changed = False
+        for name, dates, widgets in (
+            ("เส้นหลัก", self._main_cycle_dates(), self.main_date_widgets),
+            ("เส้นรอง", self._branch_cycle_dates(), self.branch_date_widgets),
+        ):
+            if self._applied_cycle.get(name) == dates:
+                continue
+            self._applied_cycle[name] = dates
+            start, end = dates
+            if (widgets["start_date"].get_date(), widgets["end_date"].get_date()) == dates:
+                continue
+            widgets["start_date"].set_date(start)
+            widgets["end_date"].set_date(end)
+            changed = True
+            if log_change:
+                self.write_log(f"เปลี่ยนรอบวันที่อัตโนมัติ ({name}): {start} → {end}")
+
+        if changed:
+            self.save_from_ui(silent=True)
+        return changed
 
     def _watch_cycle_rollover(self) -> None:
         """เช็คทุก 60 วิว่าพ้นเที่ยงเข้ารอบใหม่หรือยัง เปิดโปรแกรมค้างไว้ข้ามวันก็ขยับให้เอง"""
@@ -1715,25 +1879,20 @@ class App(ctk.CTk):
         self.after(0, _apply)
         done.wait(timeout=5)
 
-    def get_datetime_range(self, day_offset: int = 0):
-        """ช่วงเวลาที่ใช้ยิง JMS โดยเลื่อนวันได้ด้วย ``day_offset``
+    def get_datetime_range(self, line: str = "branch"):
+        """ช่วงเวลาที่ใช้ยิง JMS ของเส้นที่ระบุ อ่านจากช่องบน UI ตรง ๆ
 
-        ช่วงบน UI คือช่วงของ **เส้นรอง** (วันนี้ 12:00 → พรุ่งนี้ 12:00)
-        ส่วน **เส้นหลัก** ใช้ช่วงย้อนหลัง 1 วัน (เมื่อวาน 12:00 → วันนี้ 12:00)
-        จึงเรียกด้วย ``day_offset=MAIN_DAY_OFFSET``
+        ``line`` เป็น ``"main"`` หรือ ``"branch"`` — สองเส้นมีตัวกรองเวลาแยกกัน
+        เพราะเป็นคนละรอบงาน (ดู MAIN_ROLLOVER / BRANCH_ROLLOVER)
+        ปลายช่วงหักออก 1 วินาที เพื่อไม่ให้คาบเกี่ยวกับรอบถัดไป
         """
-        shift = timedelta(days=day_offset)
-        start_datetime = datetime.strptime(
-            f"{self.start_date.get_date()} {self.start_hour.get()}:00",
-            "%Y-%m-%d %H:%M:%S",
-        ) + shift
-        start = start_datetime.strftime("%Y-%m-%d %H:%M:%S")
+        widgets = self.main_date_widgets if line == "main" else self.branch_date_widgets
+        start = f"{widgets['start_date'].get_date()} {widgets['start_hour'].get()}:00"
         end_datetime = datetime.strptime(
-            f"{self.end_date.get_date()} {self.end_hour.get()}:00",
+            f"{widgets['end_date'].get_date()} {widgets['end_hour'].get()}:00",
             "%Y-%m-%d %H:%M:%S",
-        ) + shift - timedelta(seconds=1)
-        end = end_datetime.strftime("%Y-%m-%d %H:%M:%S")
-        return start, end
+        ) - timedelta(seconds=1)
+        return start, end_datetime.strftime("%Y-%m-%d %H:%M:%S")
 
     # ---------- Log / State ----------
     # ── Log level → tag map ──────────────────────────────────────
@@ -1820,19 +1979,21 @@ class App(ctk.CTk):
         self.current_mode = None
         self.set_status("Status: Running...")
         self.write_log("เริ่มทำงาน")
+        self._dws_output = None
 
         try:
             if (
                 not self.var_main_transport.get()
                 and not self.var_branch_transport.get()
                 and not self.var_feishu.get()
+                and not self.var_dws.get()
             ):
-                raise ValueError("กรุณาเลือกอย่างน้อย 1 งาน: Export JMS หรือ Feishu Chat")
+                raise ValueError("กรุณาเลือกอย่างน้อย 1 งาน: Export JMS, Feishu Chat หรือ DWS Report")
 
-            # Main Line — ย้อนหลัง 1 วันจากช่วงบน UI (เมื่อวาน 12:00 → วันนี้ 12:00)
+            # Main Line — ใช้ตัวกรองเวลาแถว "เส้นหลัก" (พลิกวันตอน 01:30)
             if self.var_main_transport.get():
 
-                start, end = self.get_datetime_range(day_offset=MAIN_DAY_OFFSET)
+                start, end = self.get_datetime_range("main")
 
                 export_jms_excel(
                     auth_token=self.get_setting("jms_auth_token"),
@@ -1844,7 +2005,7 @@ class App(ctk.CTk):
                     log=self.write_log,
                 )
 
-            # Branch Line — ใช้ช่วงบน UI ตรง ๆ (วันนี้ 12:00 → พรุ่งนี้ 12:00)
+            # Branch Line — ใช้ตัวกรองเวลาแถว "เส้นรอง" (พลิกวันตอน 12:00)
             if self.var_branch_transport.get():
 
                 start, end = self.get_datetime_range()
@@ -1861,6 +2022,13 @@ class App(ctk.CTk):
 
             if self.stop_requested:
                 self.write_log("หยุดก่อนส่ง Feishu Chat")
+                self.set_status("Status: Stopped")
+                return
+
+            if self.var_dws.get():
+                self.run_dws_report()
+
+            if self.stop_requested:
                 self.set_status("Status: Stopped")
                 return
 
@@ -2009,6 +2177,141 @@ class App(ctk.CTk):
                 pass
             pythoncom.CoUninitialize()
 
+    def _dws_paths(self) -> dict:
+        """path ของทุกช่องที่ตั้งไว้ในหน้า Setting (ข้ามช่องที่เว้นว่าง)"""
+        paths = {}
+        for i in range(1, 9):
+            value = self.get_setting(f"dws{i}_path")
+            if value:
+                paths[i] = value
+        value = self.get_setting("dws9_11_path")
+        if value:
+            paths["9-11"] = value
+        return paths
+
+    def _dws_store_folder(self) -> str:
+        return self.get_setting("dws_store_path") or self.get_setting("jms_save_path")
+
+    def run_dws_report(self):
+        """รวมเวลาลงพัสดุแยกตามช่อง DWS
+
+        ทำ 3 ขั้น: อ่านไฟล์ realtime สะสมลงคลัง → ดึง Report ของรอบที่ลงของ
+        เสร็จแล้วมา upsert → join แล้วสรุป
+        """
+        if dws_report is None:
+            raise RuntimeError(f"ไม่สามารถ import โมดูล DWS ได้: {DWS_IMPORT_ERROR}")
+
+        paths = self._dws_paths()
+        if not paths:
+            raise ValueError("ยังไม่ได้ตั้ง path ของ DWS ในหน้า Setting")
+
+        store = self._dws_store_folder()
+        if not store:
+            raise ValueError("กรุณาตั้ง DWS คลังสะสมข้อมูล หรือ JMS Save Path ในหน้า Setting")
+        os.makedirs(store, exist_ok=True)
+
+        self.write_log("── DWS: อ่านไฟล์ realtime ─────────")
+        dws_collect.collect(paths, store, log=self.write_log, stop_checker=self.stop_checker)
+        self.write_log(f"  {dws_collect.store_summary(store)}")
+
+        if self.stop_requested:
+            return
+
+        # ช่วงที่นับสแกน = รอบวันปฏิบัติการ ใช้ของเส้นรอง (12:00 → 12:00)
+        start, end = self.get_datetime_range("branch")
+        self.write_log(f"  ช่วงที่นับ: {start} → {end}")
+
+        # เตือนถ้าเลือกช่วงที่ยังไม่จบ — รถยังลงของไม่เสร็จ ตัวเลขจะยังไม่ครบ
+        if end > datetime.now().strftime("%Y-%m-%d %H:%M:%S"):
+            self.write_log(
+                "  ⚠ ช่วงนี้ยังไม่จบ ข้อมูลจะยังไม่ครบ — "
+                "ถ้าต้องการยอดเต็มวัน ให้เลือกช่วงที่ผ่านไปแล้ว",
+                level="WARN",
+            )
+
+        # Report ใช้ช่วงเดียวกัน — คอลัมน์เวลาลงพัสดุจะกรอกก็ต่อเมื่อรถลงของเสร็จแล้ว
+        # ค่าจะสะสมเพิ่มขึ้นทุกรอบที่ดึงซ้ำ
+        token = self.get_setting("jms_auth_token")
+        folder = self.get_setting("jms_save_path") or store
+
+        self.write_log("── DWS: ดึง Report ของรอบที่ลงของเสร็จแล้ว ─────────")
+        main_start, main_end = self.get_datetime_range("main")
+        try:
+            main_file = export_jms_excel(
+                auth_token=token, save_folder=folder, filename="dws_main.xlsx",
+                start_time=main_start, end_time=main_end,
+                stop_checker=self.stop_checker, log=lambda m: None,
+            )
+            dws_report.upsert_tasks(store, main_file, "เส้นหลัก", log=self.write_log)
+        except Exception as exc:
+            self.write_log(f"  ดึง Report เส้นหลักไม่สำเร็จ: {exc}", level="WARN")
+
+        if self.stop_requested:
+            return
+
+        try:
+            branch_file = export_branch_tracking(
+                auth_token=token, start_time=start, end_time=end,
+                save_folder=folder, filename="dws_branch.xlsx",
+                stop_checker=self.stop_checker, log=lambda m: None,
+            )
+            dws_report.upsert_tasks(store, branch_file, "เส้นรอง", log=self.write_log)
+        except Exception as exc:
+            self.write_log(f"  ดึง Report เส้นรองไม่สำเร็จ: {exc}", level="WARN")
+
+        if self.stop_requested:
+            return
+
+        summary, detail, missing = dws_report.build_summary(store, start, end)
+        if not len(detail):
+            self.write_log(f"ไม่มีข้อมูลสแกนในช่วง {start} → {end}", level="WARN")
+            self.write_log(f"  {dws_collect.store_summary(store)}", level="WARN")
+            return
+
+        matched = detail.dropna(subset=["เวลาลงพัสดุ(ชม.)"])["หมายเลขใบงาน"].nunique()
+        total = detail["หมายเลขใบงาน"].nunique()
+
+        self.write_log("── DWS: เวลาลงพัสดุรวมแยกตามช่อง ─────────")
+        for bay, row in summary.iterrows():
+            hours = row["เวลารวม"]
+            if hours is None or hours != hours:   # NaN = ช่องที่ไม่ได้ใช้งาน
+                continue
+            self.write_log(
+                f"  ช่อง {bay:>2}: {dws_report.hhmm(hours):>7} ชม:นาที | "
+                f"{row['ใบงาน']:>3} ใบงาน | {row['สแกน']:>7,} ชิ้น"
+            )
+        grand = summary["เวลารวม"].sum()
+        self.write_log(f"  รวมทุกช่อง {dws_report.hhmm(grand)} ชม:นาที "
+                       f"| จับคู่ใบงานได้ {matched}/{total}")
+
+        output = os.path.join(folder, "DWS_Report.xlsx")
+        dws_report.write_excel(output, summary, detail, missing, meta={
+            "ช่วงเวลา": f"{start} → {end}",
+            "จับคู่ใบงานได้": f"{matched}/{total}",
+            "รวมทุกช่อง (ชม:นาที)": dws_report.hhmm(grand),
+            "สร้างเมื่อ": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        self.write_log(f"DWS Report สำเร็จ: {output}")
+
+        # เตรียมรูปไว้ให้ run_feishu_chat ส่งตามลำดับ (รูปทั้งหมดก่อน แล้วค่อยไฟล์)
+        self._dws_output = {"excel": output, "image": None}
+        if not self.var_feishu.get():
+            return
+
+        png_folder = self.get_setting("png_output_folder") or folder
+        image_path = os.path.join(png_folder, "dws_report.png")
+        try:
+            run_create(
+                excel_path=output, sheet_name="1", cell_range="A1:E12",   # เฉพาะตาราง 11 ช่อง + หัวตาราง ไม่เอาบล็อก meta ข้างล่าง
+                output_path=image_path,
+                report_date=None,          # ห้ามเขียนทับ B2 ของชีตสรุป
+                log=self.write_log,
+                stop_checker=self.stop_checker,
+            )
+            self._dws_output["image"] = image_path
+        except Exception as exc:
+            self.write_log(f"สร้างรูป DWS ไม่สำเร็จ: {exc}", level="WARN")
+
     def run_feishu_chat(self):
         if run_create is None:
             raise RuntimeError(f"ไม่สามารถ import createpng.py ได้: {CREATEPNG_IMPORT_ERROR}")
@@ -2143,6 +2446,24 @@ class App(ctk.CTk):
 
             sent_count += 1
 
+        # รูปตารางเวลา DWS ต่อท้ายรูปเส้นหลัก/เส้นรอง
+        dws = getattr(self, "_dws_output", None) or {}
+        if dws.get("image") and os.path.exists(dws["image"]):
+            if token is None:
+                token = get_tenant_access_token(
+                    self.get_setting("app_id"),
+                    self.get_setting("app_secret"),
+                    log=self.write_log
+                )
+            name = os.path.basename(dws["image"])
+            self.write_log(f"อัปโหลดรูปไป Feishu: {name}")
+            image_key = upload_feishu_image(token, dws["image"], log=self.write_log)
+            self.write_log(f"ส่งรูปเข้า Feishu: {name}")
+            send_feishu_image_by_chat_id(
+                token, self.get_setting("chat_id"), image_key, log=self.write_log
+            )
+            sent_count += 1
+
         for item in generated_excel_files:
             if self.stop_requested:
                 self.write_log("ยกเลิกก่อนส่งไฟล์ Excel")
@@ -2168,6 +2489,25 @@ class App(ctk.CTk):
 
             sent_file_count += 1
 
+        # ไฟล์ตารางเวลา DWS ปิดท้ายสุด
+        if dws.get("excel") and os.path.exists(dws["excel"]):
+            if token is None:
+                token = get_tenant_access_token(
+                    self.get_setting("app_id"),
+                    self.get_setting("app_secret"),
+                    log=self.write_log
+                )
+            name = os.path.basename(dws["excel"])
+            self.write_log(f"อัปโหลดไฟล์ Excel ไป Feishu: {name}")
+            file_key = upload_feishu_file(token, dws["excel"], log=self.write_log)
+            self.write_log(f"ส่งไฟล์ Excel เข้า Feishu: {name}")
+            send_feishu_file_by_chat_id(
+                token, self.get_setting("chat_id"), file_key, log=self.write_log
+            )
+            sent_file_count += 1
+
+        self._dws_output = None
+
         self.write_log(
             f"Feishu Chat สำเร็จ: สร้าง {created_count} รูป / ส่งรูป {sent_count} รูป / ส่ง Excel {sent_file_count} ไฟล์"
         )
@@ -2177,10 +2517,11 @@ class App(ctk.CTk):
         widgets = [
             self.run_hour_interval,
             self.run_minute_interval,
-            self.start_hour,
-            self.end_hour,
-            self.start_date,
-            self.end_date,
+            *self.hour_widgets.values(),
+            self.main_date_widgets['start_date'],
+            self.main_date_widgets['end_date'],
+            self.branch_date_widgets['start_date'],
+            self.branch_date_widgets['end_date'],
         ]
 
         for widget in widgets:
@@ -2206,10 +2547,11 @@ class App(ctk.CTk):
         widgets = [
             self.run_hour_interval,
             self.run_minute_interval,
-            self.start_hour,
-            self.end_hour,
-            self.start_date,
-            self.end_date,
+            *self.hour_widgets.values(),
+            self.main_date_widgets['start_date'],
+            self.main_date_widgets['end_date'],
+            self.branch_date_widgets['start_date'],
+            self.branch_date_widgets['end_date'],
         ]
 
         for widget in widgets:

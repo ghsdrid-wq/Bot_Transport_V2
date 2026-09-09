@@ -262,10 +262,16 @@ def _hide_from_taskbar(excel):
 
 
 def _is_blank_image(path):
-    """ตรวจว่ารูปขาวหรือเปล่า — ใช้ Pillow ถ้ามี ไม่งั้นใช้ file size"""
+    """ตรวจว่ารูปขาวหรือเปล่า
+
+    ตัดสินจาก "สีในรูป" เป็นหลัก — รูปที่ขาวจริงจะสว่างเกือบสุดและแทบไม่มีความต่าง
+    ของสีเลย ขนาดไฟล์ใช้เป็นเกณฑ์ไม่ได้ เพราะตารางเล็ก ๆ ที่มีเนื้อหาครบก็อาจ
+    ไม่ถึง 10 KB (ตารางสรุป DWS ได้ ~9.9 KB แต่มีข้อมูลเต็ม) เกณฑ์ขนาดไฟล์จึงใช้
+    เฉพาะตอนไม่มี Pillow เท่านั้น
+    """
     if not os.path.exists(path):
         return True
-    if os.path.getsize(path) < MIN_PNG_BYTES:
+    if os.path.getsize(path) < 1024:      # เล็กขนาดนี้คือไฟล์เสีย/ว่างจริง
         return True
     try:
         from PIL import Image, ImageStat
@@ -277,7 +283,8 @@ def _is_blank_image(path):
             variance = sum(stat.var) / 3
             return mean > 246 and variance < 45
     except Exception:
-        return False
+        # ไม่มี Pillow — ถอยไปใช้เกณฑ์ขนาดไฟล์แบบเดิม
+        return os.path.getsize(path) < MIN_PNG_BYTES
 
 
 def run_create(
